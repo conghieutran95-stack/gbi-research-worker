@@ -3,6 +3,7 @@ import {
   type Browser,
   type BrowserContext,
   type Page,
+  type Response,
 } from "playwright";
 
 import type {
@@ -10,130 +11,142 @@ import type {
   JobStatus,
 } from "../types/discovery.js";
 
-const BASE_URL = "https://adstransparency.google.com/";
+const BASE_URL =
+  "https://adstransparency.google.com/";
 
-type AdvertiserType =
-  | "BRAND"
-  | "UNKNOWN"
-  | "DISCOVERY_ADVERTISER";
+const SEARCH_CREATIVES_PATH =
+  "/SearchService/SearchCreatives";
 
-type Confidence =
-  | "HIGH"
-  | "MEDIUM"
-  | "LOW";
+/* =========================================================
+   TYPES
+========================================================= */
 
-type AdvertiserRow = {
-  advertiser_name: string;
+type CapturedCreative = {
   advertiser_id: string;
-  text_ads_count: number;
+  advertiser_name: string;
+
+  creative_id: string;
+
+  domain: string;
+
+  format_code?: number;
+
   first_seen?: string;
   last_seen?: string;
-  advertiser_type: AdvertiserType;
-  expand: boolean;
-  confidence: Confidence;
+
+  raw_payload?: unknown;
 };
 
-type DomCandidate = {
-  tag?: string;
-  text?: string;
-  href?: string;
-  ariaLabel?: string;
-  role?: string;
-  parentText?: string;
+type AdvertiserSummary = {
+  advertiser_id: string;
+  advertiser_name: string;
+
+  domain: string;
+
+  creative_count: number;
+
+  first_seen?: string;
+  last_seen?: string;
+
+  advertiser_type:
+    | "BRAND"
+    | "UNKNOWN";
+
+  expand: boolean;
+
+  confidence:
+    | "HIGH"
+    | "MEDIUM";
 };
 
 /* =========================================================
-   HELPERS
+   BASIC HELPERS
 ========================================================= */
 
-function normalizeText(value?: string | null): string {
+function normalizeText(
+  value?: string | null
+): string {
   return (value || "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function detectBlockState(
-  text: string
-): {
-  status?: JobStatus;
-  message?: string;
-} {
-  const v = text.toLowerCase();
-
-  if (
-    v.includes("captcha") ||
-    v.includes("unusual traffic") ||
-    v.includes("verify you are human")
-  ) {
-    return {
-      status: "manual_required",
-      message: "Human verification/CAPTCHA detected.",
-    };
-  }
-
-  if (
-    v.includes("access denied") ||
-    v.includes("too many requests") ||
-    v.includes("rate limit")
-  ) {
-    return {
-      status: "blocked",
-      message: "Google blocked or rate-limited this request.",
-    };
-  }
-
-  return {};
+function normalizeDomain(
+  value: string
+): string {
+  return value
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .split("/")[0]
+    .trim();
 }
 
-/* =========================================================
-   BRAND NORMALIZATION
-========================================================= */
-
-function normalizeBrandName(value: string): string {
+function normalizeBrandName(
+  value: string
+): string {
   return value
     .toLowerCase()
     .replace(
       /\b(llc|ltd|limited|inc|incorporated|corp|corporation|company|co|plc|gmbh|pty)\b/g,
       ""
     )
-    .replace(/[^a-z0-9]/g, "")
+    .replace(
+      /[^a-z0-9]/g,
+      ""
+    )
     .trim();
 }
 
-function domainBrand(domain: string): string {
-  const hostname = domain
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .split("/")[0];
+function domainBrand(
+  domain: string
+): string {
+  const hostname =
+    normalizeDomain(domain);
+
+  const first =
+    hostname.split(".")[0] || "";
 
   return normalizeBrandName(
-    hostname.split(".")[0] || ""
+    first
   );
 }
 
 /* =========================================================
-   CLASSIFIER
+   BRAND CLASSIFIER
 ========================================================= */
 
 function classifyAdvertiser(
   advertiserName: string,
-  seedDomain: string,
-  adsCount: number
+  seedDomain: string
 ): {
-  type: AdvertiserType;
+  advertiser_type:
+    | "BRAND"
+    | "UNKNOWN";
+
   expand: boolean;
-  confidence: Confidence;
+
+  confidence:
+    | "HIGH"
+    | "MEDIUM";
 } {
   const advertiser =
-    normalizeBrandName(advertiserName);
+    normalizeBrandName(
+      advertiserName
+    );
 
   const brand =
-    domainBrand(seedDomain);
+    domainBrand(
+      seedDomain
+    );
 
   /*
-   * COMFRT / COMFRT LLC / COMFRT Clothing
-   * vs comfrt.com
+   * Example:
+   *
+   * comfrt.com
+   * Comfrt LLC
+   *
+   * => BRAND
    */
   if (
     advertiser &&
@@ -145,540 +158,814 @@ function classifyAdvertiser(
     )
   ) {
     return {
-      type: "BRAND",
-      expand: false,
-      confidence: "HIGH",
+      advertiser_type:
+        "BRAND",
+
+      expand:
+        false,
+
+      confidence:
+        "HIGH",
     };
   }
 
   /*
-   * Chưa được phép kết luận affiliate ở Mode 1.
-   * Phải sang Mode 2 xem advertiser chạy bao nhiêu domain.
+   * At DOMAIN_SEARCH stage we cannot
+   * conclusively call this affiliate/agency.
+   *
+   * Mode 2 will inspect how many domains
+   * this advertiser runs.
    */
-  if (adsCount >= 20) {
-    return {
-      type: "UNKNOWN",
-      expand: true,
-      confidence: "LOW",
-    };
-  }
-
   return {
-    type: "UNKNOWN",
-    expand: true,
-    confidence: "MEDIUM",
+    advertiser_type:
+      "UNKNOWN",
+
+    expand:
+      true,
+
+    confidence:
+      "MEDIUM",
   };
 }
 
 /* =========================================================
-   DATE EXTRACTION
+   BLOCK DETECTION
 ========================================================= */
 
-function extractDates(text: string): string[] {
-  const patterns = [
-    /\b\d{4}-\d{2}-\d{2}\b/g,
+function detectBlockState(
+  text: string
+): {
+  status?: JobStatus;
+  message?: string;
+} {
+  const value =
+    text.toLowerCase();
 
-    /\b\d{1,2}\/\d{1,2}\/\d{4}\b/g,
+  if (
+    value.includes("captcha") ||
+    value.includes(
+      "unusual traffic"
+    ) ||
+    value.includes(
+      "verify you are human"
+    )
+  ) {
+    return {
+      status:
+        "manual_required",
 
-    /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b/gi,
-  ];
-
-  const dates: string[] = [];
-
-  for (const pattern of patterns) {
-    dates.push(
-      ...(text.match(pattern) || [])
-    );
+      message:
+        "Human verification/CAPTCHA detected.",
+    };
   }
 
-  return [...new Set(dates)];
+  if (
+    value.includes(
+      "access denied"
+    ) ||
+    value.includes(
+      "too many requests"
+    ) ||
+    value.includes(
+      "rate limit"
+    )
+  ) {
+    return {
+      status:
+        "blocked",
+
+      message:
+        "Google blocked or rate-limited this request.",
+    };
+  }
+
+  return {};
 }
 
 /* =========================================================
-   ADVERTISER ID
+   GOOGLE TIMESTAMP
 ========================================================= */
 
-function extractAdvertiserId(
-  value: string
+function googleTimestampToIso(
+  value: any
 ): string | undefined {
-  const match =
-    value.match(
-      /\bAR[A-Z0-9_-]{5,}\b/i
+  if (
+    !value ||
+    typeof value !== "object"
+  ) {
+    return undefined;
+  }
+
+  /*
+   * SearchCreatives response example:
+   *
+   * "6": {
+   *   "1": "1777706604",
+   *   "2": 406772000
+   * }
+   */
+
+  const seconds =
+    Number(value["1"]);
+
+  const nanos =
+    Number(
+      value["2"] || 0
     );
 
-  return match?.[0];
+  if (
+    !Number.isFinite(seconds)
+  ) {
+    return undefined;
+  }
+
+  const milliseconds =
+    seconds * 1000 +
+    Math.floor(
+      nanos / 1_000_000
+    );
+
+  const date =
+    new Date(milliseconds);
+
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return undefined;
+  }
+
+  return date.toISOString();
 }
 
 /* =========================================================
-   LOAD RESULTS
+   RESPONSE JSON PARSER
 ========================================================= */
 
-async function expandResults(
+function parseGoogleResponseText(
+  text: string
+): any | undefined {
+  let value =
+    text.trim();
+
+  /*
+   * Handle Google's optional anti-XSSI prefix.
+   */
+  if (
+    value.startsWith(")]}'")
+  ) {
+    const newline =
+      value.indexOf("\n");
+
+    if (
+      newline >= 0
+    ) {
+      value =
+        value.slice(
+          newline + 1
+        );
+    }
+  }
+
+  try {
+    return JSON.parse(
+      value
+    );
+  } catch {}
+
+  /*
+   * Fallback:
+   * find first JSON object/array.
+   */
+  const objectStart =
+    value.indexOf("{");
+
+  const arrayStart =
+    value.indexOf("[");
+
+  let start = -1;
+
+  if (
+    objectStart >= 0 &&
+    arrayStart >= 0
+  ) {
+    start =
+      Math.min(
+        objectStart,
+        arrayStart
+      );
+  } else {
+    start =
+      Math.max(
+        objectStart,
+        arrayStart
+      );
+  }
+
+  if (
+    start < 0
+  ) {
+    return undefined;
+  }
+
+  try {
+    return JSON.parse(
+      value.slice(start)
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/* =========================================================
+   RECURSIVE CREATIVE FINDER
+
+   SearchCreatives record structure observed:
+
+   {
+     "1": "AR....",
+     "2": "CR....",
+     "3": {...creative...},
+     "4": 1/2/3,
+     "6": {...timestamp...},
+     "7": {...timestamp...},
+     "12": "Comfrt LLC",
+     "14": "comfrt.com"
+   }
+========================================================= */
+
+function extractCreativesRecursive(
+  value: any,
+  output: CapturedCreative[],
+  seenCreativeIds: Set<string>
+): void {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return;
+  }
+
+  if (
+    Array.isArray(value)
+  ) {
+    for (
+      const child
+      of value
+    ) {
+      extractCreativesRecursive(
+        child,
+        output,
+        seenCreativeIds
+      );
+    }
+
+    return;
+  }
+
+  if (
+    typeof value !==
+    "object"
+  ) {
+    return;
+  }
+
+  const advertiserId =
+    typeof value["1"] ===
+      "string"
+      ? value["1"]
+      : undefined;
+
+  const creativeId =
+    typeof value["2"] ===
+      "string"
+      ? value["2"]
+      : undefined;
+
+  const advertiserName =
+    typeof value["12"] ===
+      "string"
+      ? normalizeText(
+          value["12"]
+        )
+      : undefined;
+
+  const domain =
+    typeof value["14"] ===
+      "string"
+      ? normalizeDomain(
+          value["14"]
+        )
+      : undefined;
+
+  /*
+   * Strong signature for SearchCreatives record.
+   */
+  if (
+    advertiserId &&
+    advertiserId.startsWith(
+      "AR"
+    ) &&
+    creativeId &&
+    creativeId.startsWith(
+      "CR"
+    ) &&
+    advertiserName &&
+    domain
+  ) {
+    if (
+      !seenCreativeIds.has(
+        creativeId
+      )
+    ) {
+      seenCreativeIds.add(
+        creativeId
+      );
+
+      output.push({
+        advertiser_id:
+          advertiserId,
+
+        advertiser_name:
+          advertiserName,
+
+        creative_id:
+          creativeId,
+
+        domain,
+
+        format_code:
+          typeof value["4"] ===
+            "number"
+            ? value["4"]
+            : undefined,
+
+        first_seen:
+          googleTimestampToIso(
+            value["6"]
+          ),
+
+        last_seen:
+          googleTimestampToIso(
+            value["7"]
+          ),
+
+        raw_payload:
+          value,
+      });
+    }
+  }
+
+  /*
+   * Continue recursive search.
+   */
+  for (
+    const child
+    of Object.values(value)
+  ) {
+    if (
+      typeof child ===
+        "object" &&
+      child !== null
+    ) {
+      extractCreativesRecursive(
+        child,
+        output,
+        seenCreativeIds
+      );
+    }
+  }
+}
+
+/* =========================================================
+   PAGINATION TOKEN FINDER
+
+   We don't directly replay it yet.
+   We log it so we can implement pagination
+   after confirming network capture.
+========================================================= */
+
+function findLikelyPaginationTokens(
+  value: any,
+  output: string[],
+  depth = 0
+): void {
+  if (
+    depth > 5 ||
+    value === null ||
+    value === undefined
+  ) {
+    return;
+  }
+
+  if (
+    Array.isArray(value)
+  ) {
+    for (
+      const child
+      of value
+    ) {
+      findLikelyPaginationTokens(
+        child,
+        output,
+        depth + 1
+      );
+    }
+
+    return;
+  }
+
+  if (
+    typeof value !==
+    "object"
+  ) {
+    return;
+  }
+
+  for (
+    const [
+      key,
+      child,
+    ]
+    of Object.entries(value)
+  ) {
+    /*
+     * In observed SearchCreatives response,
+     * top-level key "2" contained a long token.
+     *
+     * Only log long opaque strings.
+     */
+    if (
+      key === "2" &&
+      typeof child ===
+        "string" &&
+      child.length >= 30 &&
+      !child.startsWith(
+        "CR"
+      )
+    ) {
+      output.push(
+        child
+      );
+    }
+
+    if (
+      typeof child ===
+        "object" &&
+      child !== null
+    ) {
+      findLikelyPaginationTokens(
+        child,
+        output,
+        depth + 1
+      );
+    }
+  }
+}
+
+/* =========================================================
+   NETWORK RESPONSE CAPTURE
+========================================================= */
+
+async function captureSearchCreativeResponse(
+  response: Response,
+  capturedCreatives: CapturedCreative[],
+  seenCreativeIds: Set<string>,
+  paginationTokens: Set<string>
+): Promise<void> {
+  const url =
+    response.url();
+
+  if (
+    !url.includes(
+      SEARCH_CREATIVES_PATH
+    )
+  ) {
+    return;
+  }
+
+  console.log(
+    "[SPY ADS NETWORK] SearchCreatives response:",
+    response.status(),
+    url
+  );
+
+  try {
+    const text =
+      await response.text();
+
+    console.log(
+      "[SPY ADS NETWORK] Response bytes:",
+      text.length
+    );
+
+    const data =
+      parseGoogleResponseText(
+        text
+      );
+
+    if (!data) {
+      console.log(
+        "[SPY ADS NETWORK] Unable to parse SearchCreatives response."
+      );
+
+      return;
+    }
+
+    const before =
+      capturedCreatives.length;
+
+    extractCreativesRecursive(
+      data,
+      capturedCreatives,
+      seenCreativeIds
+    );
+
+    const added =
+      capturedCreatives.length -
+      before;
+
+    console.log(
+      "[SPY ADS NETWORK] Creatives added:",
+      added
+    );
+
+    const tokens:
+      string[] = [];
+
+    findLikelyPaginationTokens(
+      data,
+      tokens
+    );
+
+    for (
+      const token
+      of tokens
+    ) {
+      paginationTokens.add(
+        token
+      );
+    }
+  } catch (
+    error
+  ) {
+    console.error(
+      "[SPY ADS NETWORK] Response capture failed:",
+      error
+    );
+  }
+}
+
+/* =========================================================
+   PAGE LOADING
+========================================================= */
+
+async function expandPage(
   page: Page
 ): Promise<void> {
   /*
-   * Google render lazy-load.
-   * Scroll chậm nhiều lần.
+   * Scroll progressively rather than
+   * immediately jumping only once.
+   *
+   * This gives Google's frontend time to
+   * issue additional SearchCreatives calls.
    */
-  for (let i = 0; i < 12; i++) {
-    await page.evaluate(() => {
-      window.scrollTo(
-        0,
-        document.body.scrollHeight
-      );
-    });
+  for (
+    let i = 0;
+    i < 15;
+    i++
+  ) {
+    await page.evaluate(
+      () => {
+        window.scrollBy(
+          0,
+          Math.max(
+            window.innerHeight *
+              0.85,
+            700
+          )
+        );
+      }
+    );
 
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(
+      1100
+    );
   }
 
   /*
-   * Nếu có Load more / Show more thì click.
+   * Try load/show-more controls.
    */
   const controls = [
     page.getByRole(
       "button",
-      { name: /load more/i }
+      {
+        name:
+          /load more/i,
+      }
     ),
 
     page.getByRole(
       "button",
-      { name: /show more/i }
+      {
+        name:
+          /show more/i,
+      }
     ),
-
-    page.getByText(/load more/i),
-
-    page.getByText(/show more/i),
   ];
 
-  for (const locator of controls) {
+  for (
+    const locator
+    of controls
+  ) {
     try {
-      const el = locator.first();
+      const button =
+        locator.first();
 
       if (
-        await el.isVisible({
+        await button.isVisible({
           timeout: 600,
         })
       ) {
-        await el.click();
+        await button.click();
 
         await page.waitForTimeout(
-          1500
+          2000
         );
       }
     } catch {}
   }
-}
 
-/* =========================================================
-   COLLECT DOM
-========================================================= */
-
-async function collectPageCandidates(
-  page: Page
-): Promise<DomCandidate[]> {
-  return page
-    .evaluate(() => {
-      const selector = [
-        "a[href]",
-        "[role='link']",
-        "[role='listitem']",
-        "[role='row']",
-        "article",
-      ].join(",");
-
-      const nodes =
-        Array.from(
-          document.querySelectorAll(selector)
-        );
-
-      return nodes
-        .slice(0, 1500)
-        .map((node: any) => {
-          const anchor =
-            node.tagName === "A"
-              ? node
-              : node.querySelector?.("a[href]");
-
-          const parent =
-            node.parentElement;
-
-          return {
-            tag:
-              node.tagName || "",
-
-            text:
-              (
-                node.innerText ||
-                node.textContent ||
-                ""
-              )
-                .replace(/\s+/g, " ")
-                .trim()
-                .slice(0, 2500),
-
-            href:
-              anchor?.href || "",
-
-            ariaLabel:
-              node.getAttribute?.(
-                "aria-label"
-              ) || "",
-
-            role:
-              node.getAttribute?.(
-                "role"
-              ) || "",
-
-            parentText:
-              (
-                parent?.innerText ||
-                parent?.textContent ||
-                ""
-              )
-                .replace(/\s+/g, " ")
-                .trim()
-                .slice(0, 2500),
-          };
-        })
-        .filter(
-          (item: any) =>
-            item.text ||
-            item.href ||
-            item.ariaLabel
-        );
-    })
-    .catch(() => []);
-}
-
-/* =========================================================
-   UI NOISE
-========================================================= */
-
-function isNoiseText(
-  value: string
-): boolean {
-  const v =
-    normalizeText(value)
-      .toLowerCase();
-
-  const noise = [
-    "explore paid promotions on youtube",
-    "paid promotions on youtube",
-    "youtube",
-    "privacy",
-    "terms",
-    "about google",
-    "ads transparency center",
-    "search by advertiser or website",
-    "search by advertiser",
-    "google safety center",
-    "report an ad",
-    "why this ad",
-    "my ad center",
-  ];
-
-  return noise.some(
-    text =>
-      v === text ||
-      v.startsWith(text)
+  await page.waitForTimeout(
+    3000
   );
 }
 
 /* =========================================================
-   ADVERTISER NAME
+   GROUP BY ADVERTISER
 ========================================================= */
 
-function extractAdvertiserName(
-  candidate: DomCandidate,
-  advertiserId: string
-): string {
-  const sources = [
-    candidate.text,
-    candidate.parentText,
-    candidate.ariaLabel,
-  ];
-
-  for (const source of sources) {
-    if (!source) continue;
-
-    let value =
-      normalizeText(source);
-
-    value =
-      value.replace(
-        new RegExp(
-          advertiserId,
-          "gi"
-        ),
-        ""
-      );
-
-    value =
-      value
-        .replace(
-          /advertiser details/gi,
-          ""
-        )
-        .replace(
-          /about this advertiser/gi,
-          ""
-        )
-        .replace(
-          /\bverified advertiser\b/gi,
-          ""
-        )
-        .replace(
-          /\badvertiser\b/gi,
-          ""
-        )
-        .replace(
-          /\bverified\b/gi,
-          ""
-        )
-        .replace(
-          /\s+/g,
-          " "
-        )
-        .trim();
-
-    /*
-     * Nếu lấy nguyên card dài thì lấy phần đầu.
-     */
-    if (value.length > 140) {
-      value =
-        value
-          .split(/[|•·\n]/g)
-          .map(normalizeText)
-          .filter(Boolean)[0] || "";
-    }
-
-    if (!value) continue;
-
-    if (isNoiseText(value)) {
-      continue;
-    }
-
-    if (
-      /^AR[A-Z0-9_-]+$/i.test(value)
-    ) {
-      continue;
-    }
-
-    if (
-      /^https?:\/\//i.test(value)
-    ) {
-      continue;
-    }
-
-    return value;
-  }
-
-  return "";
-}
-
-/* =========================================================
-   PARSE DOMAIN -> ADVERTISERS
-========================================================= */
-
-async function parseAdvertisers(
-  page: Page,
+function buildAdvertiserSummaries(
+  creatives: CapturedCreative[],
   seedDomain: string
-): Promise<{
-  advertisers: AdvertiserRow[];
-  diagnostics: DomCandidate[];
-}> {
-  const candidates =
-    await collectPageCandidates(page);
+): AdvertiserSummary[] {
+  type Temp = {
+    advertiser_id: string;
+    advertiser_name: string;
+    domain: string;
 
-  type TempAdvertiser = {
-    name: string;
-    id: string;
-    count: number;
-    dates: string[];
-    samples: string[];
+    creativeIds:
+      Set<string>;
+
+    dates:
+      string[];
   };
 
-  const advertiserMap =
+  const map =
     new Map<
       string,
-      TempAdvertiser
+      Temp
     >();
 
-  for (const candidate of candidates) {
-    const combined =
-      normalizeText(
-        [
-          candidate.text,
-          candidate.href,
-          candidate.ariaLabel,
-          candidate.parentText,
-        ].join(" ")
-      );
-
+  for (
+    const creative
+    of creatives
+  ) {
     /*
-     * Chỉ chấp nhận record có AR ID thật.
+     * In DOMAIN_SEARCH we only care about
+     * records pointing to the requested domain.
      */
-    const advertiserId =
-      extractAdvertiserId(
-        combined
-      );
-
-    if (!advertiserId) {
-      continue;
-    }
-
-    /*
-     * Phải liên quan advertiser URL thật của Transparency.
-     */
-    const href =
-      candidate.href || "";
-
-    const validAdvertiserRecord =
-      href.includes(
-        "adstransparency.google.com/advertiser/"
-      ) ||
-      combined.includes(
-        "/advertiser/"
-      );
-
     if (
-      !validAdvertiserRecord
+      normalizeDomain(
+        creative.domain
+      ) !==
+      normalizeDomain(
+        seedDomain
+      )
     ) {
       continue;
     }
 
-    const advertiserName =
-      extractAdvertiserName(
-        candidate,
-        advertiserId
-      );
+    const key =
+      creative.advertiser_id;
 
-    const dates =
-      extractDates(combined);
+    const existing =
+      map.get(key);
 
-    const current =
-      advertiserMap.get(
-        advertiserId
-      );
-
-    if (current) {
-      current.count += 1;
-
-      current.dates.push(
-        ...dates
+    if (
+      existing
+    ) {
+      existing.creativeIds.add(
+        creative.creative_id
       );
 
       if (
-        current.samples.length < 5
+        creative.first_seen
       ) {
-        current.samples.push(
-          combined.slice(
-            0,
-            1200
-          )
+        existing.dates.push(
+          creative.first_seen
         );
       }
 
-      /*
-       * Nếu lần đầu chưa lấy được name,
-       * dùng name tốt hơn ở candidate sau.
-       */
       if (
-        (
-          !current.name ||
-          current.name === advertiserId
-        ) &&
-        advertiserName
+        creative.last_seen
       ) {
-        current.name =
-          advertiserName;
+        existing.dates.push(
+          creative.last_seen
+        );
       }
 
       continue;
     }
 
-    advertiserMap.set(
-      advertiserId,
+    const dates:
+      string[] = [];
+
+    if (
+      creative.first_seen
+    ) {
+      dates.push(
+        creative.first_seen
+      );
+    }
+
+    if (
+      creative.last_seen
+    ) {
+      dates.push(
+        creative.last_seen
+      );
+    }
+
+    map.set(
+      key,
       {
-        name:
-          advertiserName ||
-          advertiserId,
+        advertiser_id:
+          creative.advertiser_id,
 
-        id:
-          advertiserId,
+        advertiser_name:
+          creative.advertiser_name,
 
-        count:
-          1,
+        domain:
+          creative.domain,
+
+        creativeIds:
+          new Set([
+            creative.creative_id,
+          ]),
 
         dates,
-
-        samples: [
-          combined.slice(
-            0,
-            1200
-          ),
-        ],
       }
     );
   }
 
-  const advertisers:
-    AdvertiserRow[] =
+  const summaries:
+    AdvertiserSummary[] =
     [];
 
   for (
     const item
-    of advertiserMap.values()
+    of map.values()
   ) {
-    const uniqueDates =
-      [...new Set(item.dates)]
+    const dates =
+      [...new Set(
+        item.dates
+      )]
         .sort();
-
-    let name =
-      normalizeText(item.name);
-
-    /*
-     * Ví dụ:
-     * "Comfrt LLC Verified"
-     * -> "Comfrt LLC"
-     */
-    name =
-      name
-        .replace(
-          /\s+Verified$/i,
-          ""
-        )
-        .trim();
 
     const classification =
       classifyAdvertiser(
-        name,
-        seedDomain,
-        item.count
+        item.advertiser_name,
+        seedDomain
       );
 
-    advertisers.push({
-      advertiser_name:
-        name,
-
+    summaries.push({
       advertiser_id:
-        item.id,
+        item.advertiser_id,
 
-      text_ads_count:
-        item.count,
+      advertiser_name:
+        item.advertiser_name,
+
+      domain:
+        item.domain,
+
+      creative_count:
+        item.creativeIds.size,
 
       first_seen:
-        uniqueDates[0],
+        dates[0],
 
       last_seen:
-        uniqueDates.length
-          ? uniqueDates[
-              uniqueDates.length - 1
+        dates.length
+          ? dates[
+              dates.length - 1
             ]
           : undefined,
 
       advertiser_type:
-        classification.type,
+        classification
+          .advertiser_type,
 
       expand:
         classification.expand,
@@ -688,76 +975,54 @@ async function parseAdvertisers(
     });
   }
 
-  advertisers.sort(
-    (a, b) =>
-      b.text_ads_count -
-      a.text_ads_count
+  summaries.sort(
+    (
+      a,
+      b
+    ) =>
+      b.creative_count -
+      a.creative_count
   );
 
-  /*
-   * Debug chỉ giữ candidate có AR ID thật.
-   */
-  const diagnostics =
-    candidates
-      .filter(candidate => {
-        const combined =
-          normalizeText(
-            [
-              candidate.text,
-              candidate.href,
-              candidate.ariaLabel,
-              candidate.parentText,
-            ].join(" ")
-          );
-
-        return !!extractAdvertiserId(
-          combined
-        );
-      })
-      .slice(0, 100);
-
-  return {
-    advertisers,
-    diagnostics,
-  };
+  return summaries;
 }
 
 /* =========================================================
    DEBUG
 ========================================================= */
 
-function debugDomainSearch(
+function printDebug(
   seed: string,
-  country: string | undefined,
-  sourceUrl: string,
-  advertisers: AdvertiserRow[],
-  diagnostics: DomCandidate[]
+  country: string,
+  creatives: CapturedCreative[],
+  advertisers: AdvertiserSummary[],
+  paginationTokens: Set<string>
 ): void {
   console.log(
-    "========== SPY ADS DEBUG =========="
+    "========== SPY ADS NETWORK V0.3 =========="
   );
 
   console.log(
-    "MODE: DOMAIN_SEARCH"
+    "MODE: DOMAIN_SEARCH_NETWORK"
   );
 
   console.log(
-    "SEED DOMAIN:",
+    "SEED:",
     seed
   );
 
   console.log(
     "COUNTRY:",
-    country || "anywhere"
+    country
   );
 
   console.log(
-    "FORMAT: TEXT"
+    "REQUESTED FORMAT: TEXT"
   );
 
   console.log(
-    "SOURCE URL:",
-    sourceUrl
+    "CAPTURED CREATIVES:",
+    creatives.length
   );
 
   console.log(
@@ -775,22 +1040,52 @@ function debugDomainSearch(
   );
 
   console.log(
-    "DIAGNOSTICS:",
+    "CREATIVE SAMPLE:",
     JSON.stringify(
-      diagnostics,
+      creatives
+        .slice(0, 5)
+        .map(
+          item => ({
+            advertiser_id:
+              item.advertiser_id,
+
+            advertiser_name:
+              item.advertiser_name,
+
+            creative_id:
+              item.creative_id,
+
+            domain:
+              item.domain,
+
+            format_code:
+              item.format_code,
+
+            first_seen:
+              item.first_seen,
+
+            last_seen:
+              item.last_seen,
+          })
+        ),
       null,
       2
     )
   );
 
   console.log(
-    "========== END SPY ADS DEBUG =========="
+    "PAGINATION TOKENS FOUND:",
+    paginationTokens.size
+  );
+
+  console.log(
+    "========== END SPY ADS NETWORK V0.3 =========="
   );
 }
 
 /* =========================================================
-   MODE 1
-   DOMAIN -> ADVERTISERS
+   MAIN
+   DOMAIN -> NETWORK SearchCreatives -> ADVERTISERS
 ========================================================= */
 
 export async function runGoogleAdsTransparency(
@@ -807,6 +1102,20 @@ export async function runGoogleAdsTransparency(
   let context:
     BrowserContext | undefined;
 
+  const capturedCreatives:
+    CapturedCreative[] =
+    [];
+
+  const seenCreativeIds =
+    new Set<string>();
+
+  const paginationTokens =
+    new Set<string>();
+
+  const region =
+    country ||
+    "anywhere";
+
   try {
     browser =
       await chromium.launch({
@@ -822,8 +1131,11 @@ export async function runGoogleAdsTransparency(
           "en-US",
 
         viewport: {
-          width: 1440,
-          height: 1100,
+          width:
+            1440,
+
+          height:
+            1100,
         },
 
         userAgent:
@@ -836,26 +1148,53 @@ export async function runGoogleAdsTransparency(
       await context.newPage();
 
     /*
-     * DIRECT DOMAIN SEARCH.
-     * TEXT ONLY.
+     * IMPORTANT:
+     * Attach listener BEFORE page.goto()
+     * so first SearchCreatives request
+     * cannot be missed.
+     */
+    page.on(
+      "response",
+      response => {
+        void captureSearchCreativeResponse(
+          response,
+          capturedCreatives,
+          seenCreativeIds,
+          paginationTokens
+        );
+      }
+    );
+
+    /*
+     * Keep Google's own frontend responsible
+     * for generating cookies/XSRF/request format.
+     *
+     * We DO NOT hard-code:
+     * - SID
+     * - SAPISID
+     * - XSRF
+     * - x-client-data
+     * - Chrome validation headers
      */
     const params =
       new URLSearchParams();
+
+    params.set(
+      "region",
+      region
+    );
 
     params.set(
       "domain",
       seed
     );
 
+    /*
+     * Ask frontend for TEXT mode.
+     */
     params.set(
       "format",
       "TEXT"
-    );
-
-    params.set(
-      "region",
-      country ||
-        "anywhere"
     );
 
     const url =
@@ -878,62 +1217,68 @@ export async function runGoogleAdsTransparency(
     );
 
     await page.waitForTimeout(
-      5000
+      7000
     );
 
-    let body =
+    const body =
       await page
         .locator("body")
         .innerText()
-        .catch(() => "");
+        .catch(
+          () => ""
+        );
 
-    let block =
-      detectBlockState(body);
+    const block =
+      detectBlockState(
+        body
+      );
 
-    if (block.status) {
+    if (
+      block.status
+    ) {
       return {
         ...block,
         results: [],
       };
     }
 
-    await expandResults(
+    /*
+     * Trigger lazy-loaded result batches.
+     */
+    await expandPage(
       page
     );
 
-    body =
-      await page
-        .locator("body")
-        .innerText()
-        .catch(() => "");
+    /*
+     * Allow final responses to finish.
+     */
+    await page.waitForTimeout(
+      3000
+    );
 
-    block =
-      detectBlockState(body);
-
-    if (block.status) {
-      return {
-        ...block,
-        results: [],
-      };
-    }
-
-    const parsed =
-      await parseAdvertisers(
-        page,
+    const advertisers =
+      buildAdvertiserSummaries(
+        capturedCreatives,
         seed
       );
 
-    debugDomainSearch(
+    printDebug(
       seed,
-      country,
-      page.url(),
-      parsed.advertisers,
-      parsed.diagnostics
+      region,
+      capturedCreatives,
+      advertisers,
+      paginationTokens
     );
 
+    /*
+     * Current project schema is still
+     * DiscoveryResult-oriented.
+     *
+     * For V0.3 return one row per advertiser.
+     */
     const results:
       DiscoveryResult[] =
-      parsed.advertisers.map(
+      advertisers.map(
         advertiser => ({
           provider:
             "google_ads_transparency",
@@ -941,7 +1286,8 @@ export async function runGoogleAdsTransparency(
           domain:
             seed,
 
-          country,
+          country:
+            region,
 
           source_url:
             page.url(),
@@ -955,25 +1301,25 @@ export async function runGoogleAdsTransparency(
 
           raw_payload: {
             mode:
-              "DOMAIN_SEARCH",
+              "DOMAIN_SEARCH_NETWORK",
+
+            requested_format:
+              "TEXT",
 
             seed_domain:
               seed,
-
-            format:
-              "TEXT",
-
-            advertiser_name:
-              advertiser
-                .advertiser_name,
 
             advertiser_id:
               advertiser
                 .advertiser_id,
 
-            text_ads_count:
+            advertiser_name:
               advertiser
-                .text_ads_count,
+                .advertiser_name,
+
+            creative_count:
+              advertiser
+                .creative_count,
 
             first_seen:
               advertiser
@@ -994,21 +1340,67 @@ export async function runGoogleAdsTransparency(
             confidence:
               advertiser
                 .confidence,
+
+            captured_creatives:
+              capturedCreatives
+                .filter(
+                  creative =>
+                    creative
+                      .advertiser_id ===
+                    advertiser
+                      .advertiser_id
+                )
+                .map(
+                  creative => ({
+                    creative_id:
+                      creative
+                        .creative_id,
+
+                    format_code:
+                      creative
+                        .format_code,
+
+                    first_seen:
+                      creative
+                        .first_seen,
+
+                    last_seen:
+                      creative
+                        .last_seen,
+                  })
+                ),
+
+            pagination_tokens_detected:
+              paginationTokens.size,
           },
         })
       );
 
     if (
-      results.length === 0
+      capturedCreatives.length ===
+      0
     ) {
       return {
         status:
           "manual_required",
 
         message:
-          "DOMAIN_SEARCH loaded but no valid advertiser records were parsed. " +
-          `seed=${seed}; url=${page.url()}. ` +
-          "Check Railway SPY ADS DEBUG logs.",
+          "Ads Transparency page loaded, but no SearchCreatives network response was captured.",
+
+        results: [],
+      };
+    }
+
+    if (
+      advertisers.length ===
+      0
+    ) {
+      return {
+        status:
+          "manual_required",
+
+        message:
+          `Captured ${capturedCreatives.length} creative record(s), but none matched seed domain ${seed}.`,
 
         results: [],
       };
@@ -1019,14 +1411,17 @@ export async function runGoogleAdsTransparency(
         "completed",
 
       message:
-        `DOMAIN_SEARCH completed. ` +
-        `Found ${results.length} valid advertiser(s) for ${seed}.`,
+        `NETWORK DOMAIN_SEARCH completed. ` +
+        `Captured ${capturedCreatives.length} creative(s) and ` +
+        `${advertisers.length} advertiser(s) for ${seed}.`,
 
       results,
     };
-  } catch (error) {
+  } catch (
+    error
+  ) {
     console.error(
-      "[SPY ADS] DOMAIN_SEARCH ERROR:",
+      "[SPY ADS] NETWORK V0.3 ERROR:",
       error
     );
 
@@ -1043,16 +1438,24 @@ export async function runGoogleAdsTransparency(
       results: [],
     };
   } finally {
-    if (context) {
+    if (
+      context
+    ) {
       await context
         .close()
-        .catch(() => {});
+        .catch(
+          () => {}
+        );
     }
 
-    if (browser) {
+    if (
+      browser
+    ) {
       await browser
         .close()
-        .catch(() => {});
+        .catch(
+          () => {}
+        );
     }
   }
 }
