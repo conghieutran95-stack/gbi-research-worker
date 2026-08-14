@@ -24,13 +24,10 @@ type Confidence =
 
 type AdvertiserRow = {
   advertiser_name: string;
-  advertiser_id?: string;
-
+  advertiser_id: string;
   text_ads_count: number;
-
   first_seen?: string;
   last_seen?: string;
-
   advertiser_type: AdvertiserType;
   expand: boolean;
   confidence: Confidence;
@@ -46,12 +43,10 @@ type DomCandidate = {
 };
 
 /* =========================================================
-   BASIC HELPERS
+   HELPERS
 ========================================================= */
 
-function normalizeText(
-  value?: string | null
-): string {
+function normalizeText(value?: string | null): string {
   return (value || "")
     .replace(/\s+/g, " ")
     .trim();
@@ -63,30 +58,27 @@ function detectBlockState(
   status?: JobStatus;
   message?: string;
 } {
-  const value =
-    text.toLowerCase();
+  const v = text.toLowerCase();
 
   if (
-    value.includes("captcha") ||
-    value.includes("unusual traffic") ||
-    value.includes("verify you are human")
+    v.includes("captcha") ||
+    v.includes("unusual traffic") ||
+    v.includes("verify you are human")
   ) {
     return {
       status: "manual_required",
-      message:
-        "Human verification/CAPTCHA detected.",
+      message: "Human verification/CAPTCHA detected.",
     };
   }
 
   if (
-    value.includes("access denied") ||
-    value.includes("too many requests") ||
-    value.includes("rate limit")
+    v.includes("access denied") ||
+    v.includes("too many requests") ||
+    v.includes("rate limit")
   ) {
     return {
       status: "blocked",
-      message:
-        "Google blocked or rate-limited this request.",
+      message: "Google blocked or rate-limited this request.",
     };
   }
 
@@ -97,48 +89,31 @@ function detectBlockState(
    BRAND NORMALIZATION
 ========================================================= */
 
-function normalizeBrandName(
-  value: string
-): string {
+function normalizeBrandName(value: string): string {
   return value
     .toLowerCase()
     .replace(
       /\b(llc|ltd|limited|inc|incorporated|corp|corporation|company|co|plc|gmbh|pty)\b/g,
       ""
     )
-    .replace(
-      /[^a-z0-9]/g,
-      ""
-    )
+    .replace(/[^a-z0-9]/g, "")
     .trim();
 }
 
-function domainBrand(
-  domain: string
-): string {
-  const hostname =
-    domain
-      .toLowerCase()
-      .replace(
-        /^https?:\/\//,
-        ""
-      )
-      .replace(
-        /^www\./,
-        ""
-      )
-      .split("/")[0];
-
-  const firstPart =
-    hostname.split(".")[0];
+function domainBrand(domain: string): string {
+  const hostname = domain
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .split("/")[0];
 
   return normalizeBrandName(
-    firstPart
+    hostname.split(".")[0] || ""
   );
 }
 
 /* =========================================================
-   ADVERTISER CLASSIFICATION
+   CLASSIFIER
 ========================================================= */
 
 function classifyAdvertiser(
@@ -151,35 +126,22 @@ function classifyAdvertiser(
   confidence: Confidence;
 } {
   const advertiser =
-    normalizeBrandName(
-      advertiserName
-    );
+    normalizeBrandName(advertiserName);
 
   const brand =
-    domainBrand(
-      seedDomain
-    );
+    domainBrand(seedDomain);
 
   /*
-   * Strong BRAND signal:
-   *
-   * COMFRT
-   * COMFRT LLC
-   * COMFRT CLOTHING LLC
-   *
-   * for comfrt.com
+   * COMFRT / COMFRT LLC / COMFRT Clothing
+   * vs comfrt.com
    */
   if (
     advertiser &&
     brand &&
     (
       advertiser === brand ||
-      advertiser.includes(
-        brand
-      ) ||
-      brand.includes(
-        advertiser
-      )
+      advertiser.includes(brand) ||
+      brand.includes(advertiser)
     )
   ) {
     return {
@@ -190,23 +152,10 @@ function classifyAdvertiser(
   }
 
   /*
-   * At DOMAIN_SEARCH stage we do NOT yet
-   * know how many distinct domains this
-   * advertiser runs.
-   *
-   * Therefore non-brand advertisers stay
-   * expandable.
-   *
-   * ADVERTISER_SEARCH will later determine:
-   *
-   * 1 domain -> likely BRAND/direct
-   * 2-3 domains -> UNKNOWN
-   * 4+ domains -> DISCOVERY_ADVERTISER
-   * 10+ domains -> POWER DISCOVERY
+   * Chưa được phép kết luận affiliate ở Mode 1.
+   * Phải sang Mode 2 xem advertiser chạy bao nhiêu domain.
    */
-  if (
-    adsCount >= 20
-  ) {
+  if (adsCount >= 20) {
     return {
       type: "UNKNOWN",
       expand: true,
@@ -225,9 +174,7 @@ function classifyAdvertiser(
    DATE EXTRACTION
 ========================================================= */
 
-function extractDates(
-  text: string
-): string[] {
+function extractDates(text: string): string[] {
   const patterns = [
     /\b\d{4}-\d{2}-\d{2}\b/g,
 
@@ -236,32 +183,19 @@ function extractDates(
     /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b/gi,
   ];
 
-  const found:
-    string[] = [];
+  const dates: string[] = [];
 
-  for (
-    const pattern
-    of patterns
-  ) {
-    const matches =
-      text.match(
-        pattern
-      ) || [];
-
-    found.push(
-      ...matches
+  for (const pattern of patterns) {
+    dates.push(
+      ...(text.match(pattern) || [])
     );
   }
 
-  return [
-    ...new Set(
-      found
-    ),
-  ];
+  return [...new Set(dates)];
 }
 
 /* =========================================================
-   ADVERTISER ID EXTRACTION
+   ADVERTISER ID
 ========================================================= */
 
 function extractAdvertiserId(
@@ -272,91 +206,63 @@ function extractAdvertiserId(
       /\bAR[A-Z0-9_-]{5,}\b/i
     );
 
-  if (
-    !match
-  ) {
-    return undefined;
-  }
-
-  return match[0];
+  return match?.[0];
 }
 
 /* =========================================================
-   LOAD DYNAMIC RESULTS
+   LOAD RESULTS
 ========================================================= */
 
 async function expandResults(
   page: Page
 ): Promise<void> {
   /*
-   * Google Transparency dynamically renders
-   * additional ad/result cards.
-   *
-   * Scroll progressively.
+   * Google render lazy-load.
+   * Scroll chậm nhiều lần.
    */
-  for (
-    let i = 0;
-    i < 10;
-    i++
-  ) {
-    await page.evaluate(
-      () => {
-        window.scrollTo(
-          0,
-          document.body.scrollHeight
-        );
-      }
-    );
+  for (let i = 0; i < 12; i++) {
+    await page.evaluate(() => {
+      window.scrollTo(
+        0,
+        document.body.scrollHeight
+      );
+    });
 
-    await page.waitForTimeout(
-      1200
-    );
+    await page.waitForTimeout(1000);
   }
 
   /*
-   * Try visible "load more" style controls.
+   * Nếu có Load more / Show more thì click.
    */
-  const possibleButtons = [
+  const controls = [
     page.getByRole(
       "button",
-      {
-        name: /load more/i,
-      }
+      { name: /load more/i }
     ),
 
     page.getByRole(
       "button",
-      {
-        name: /show more/i,
-      }
+      { name: /show more/i }
     ),
 
-    page.getByText(
-      /load more/i
-    ),
+    page.getByText(/load more/i),
 
-    page.getByText(
-      /show more/i
-    ),
+    page.getByText(/show more/i),
   ];
 
-  for (
-    const locator
-    of possibleButtons
-  ) {
+  for (const locator of controls) {
     try {
-      const button =
-        locator.first();
+      const el = locator.first();
 
       if (
-        await button.isVisible({
-          timeout: 800,
+        await el.isVisible({
+          timeout: 600,
         })
       ) {
-        await button.click();
+        await el.click();
 
         await page.waitForTimeout(
-          2000
+          1500
         );
       }
     } catch {}
@@ -364,131 +270,140 @@ async function expandResults(
 }
 
 /* =========================================================
-   DOM COLLECTION
+   COLLECT DOM
 ========================================================= */
 
 async function collectPageCandidates(
   page: Page
 ): Promise<DomCandidate[]> {
   return page
-    .evaluate(
-      () => {
-        const selector = [
-          "a[href]",
-          "[role='link']",
-          "[role='listitem']",
-          "[role='row']",
-          "article",
-        ].join(",");
+    .evaluate(() => {
+      const selector = [
+        "a[href]",
+        "[role='link']",
+        "[role='listitem']",
+        "[role='row']",
+        "article",
+      ].join(",");
 
-        const nodes =
-          Array.from(
-            document.querySelectorAll(
-              selector
-            )
-          );
+      const nodes =
+        Array.from(
+          document.querySelectorAll(selector)
+        );
 
-        return nodes
-          .slice(
-            0,
-            1200
-          )
-          .map(
-            (
-              node: any
-            ) => {
-              const anchor =
-                node.tagName === "A"
-                  ? node
-                  : node.querySelector?.(
-                      "a[href]"
-                    );
+      return nodes
+        .slice(0, 1500)
+        .map((node: any) => {
+          const anchor =
+            node.tagName === "A"
+              ? node
+              : node.querySelector?.("a[href]");
 
-              const parent =
-                node.parentElement;
+          const parent =
+            node.parentElement;
 
-              return {
-                tag:
-                  node.tagName || "",
+          return {
+            tag:
+              node.tagName || "",
 
-                text:
-                  (
-                    node.innerText ||
-                    node.textContent ||
-                    ""
-                  )
-                    .replace(
-                      /\s+/g,
-                      " "
-                    )
-                    .trim()
-                    .slice(
-                      0,
-                      2500
-                    ),
+            text:
+              (
+                node.innerText ||
+                node.textContent ||
+                ""
+              )
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, 2500),
 
-                href:
-                  anchor?.href || "",
+            href:
+              anchor?.href || "",
 
-                ariaLabel:
-                  node.getAttribute?.(
-                    "aria-label"
-                  ) || "",
+            ariaLabel:
+              node.getAttribute?.(
+                "aria-label"
+              ) || "",
 
-                role:
-                  node.getAttribute?.(
-                    "role"
-                  ) || "",
+            role:
+              node.getAttribute?.(
+                "role"
+              ) || "",
 
-                parentText:
-                  (
-                    parent?.innerText ||
-                    parent?.textContent ||
-                    ""
-                  )
-                    .replace(
-                      /\s+/g,
-                      " "
-                    )
-                    .trim()
-                    .slice(
-                      0,
-                      2500
-                    ),
-              };
-            }
-          )
-          .filter(
-            (
-              item: any
-            ) =>
-              item.text ||
-              item.href ||
-              item.ariaLabel
-          );
-      }
-    )
-    .catch(
-      () => []
-    );
+            parentText:
+              (
+                parent?.innerText ||
+                parent?.textContent ||
+                ""
+              )
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, 2500),
+          };
+        })
+        .filter(
+          (item: any) =>
+            item.text ||
+            item.href ||
+            item.ariaLabel
+        );
+    })
+    .catch(() => []);
 }
 
 /* =========================================================
-   NAME EXTRACTION
+   UI NOISE
 ========================================================= */
 
-function cleanAdvertiserName(
-  text: string,
-  advertiserId?: string
-): string {
-  let value =
-    normalizeText(
-      text
-    );
+function isNoiseText(
+  value: string
+): boolean {
+  const v =
+    normalizeText(value)
+      .toLowerCase();
 
-  if (
-    advertiserId
-  ) {
+  const noise = [
+    "explore paid promotions on youtube",
+    "paid promotions on youtube",
+    "youtube",
+    "privacy",
+    "terms",
+    "about google",
+    "ads transparency center",
+    "search by advertiser or website",
+    "search by advertiser",
+    "google safety center",
+    "report an ad",
+    "why this ad",
+    "my ad center",
+  ];
+
+  return noise.some(
+    text =>
+      v === text ||
+      v.startsWith(text)
+  );
+}
+
+/* =========================================================
+   ADVERTISER NAME
+========================================================= */
+
+function extractAdvertiserName(
+  candidate: DomCandidate,
+  advertiserId: string
+): string {
+  const sources = [
+    candidate.text,
+    candidate.parentText,
+    candidate.ariaLabel,
+  ];
+
+  for (const source of sources) {
+    if (!source) continue;
+
+    let value =
+      normalizeText(source);
+
     value =
       value.replace(
         new RegExp(
@@ -497,99 +412,99 @@ function cleanAdvertiserName(
         ),
         ""
       );
-  }
-
-  value =
-    value
-      .replace(
-        /advertiser details/gi,
-        ""
-      )
-      .replace(
-        /\badvertiser\b/gi,
-        ""
-      )
-      .replace(
-        /\babout this advertiser\b/gi,
-        ""
-      )
-      .replace(
-        /\s+/g,
-        " "
-      )
-      .trim();
-
-  /*
-   * Avoid turning an entire giant card
-   * into advertiser name.
-   */
-  if (
-    value.length >
-    180
-  ) {
-    const parts =
-      value.split(
-        /[|•·]/g
-      );
 
     value =
-      normalizeText(
-        parts[0]
-      );
+      value
+        .replace(
+          /advertiser details/gi,
+          ""
+        )
+        .replace(
+          /about this advertiser/gi,
+          ""
+        )
+        .replace(
+          /\bverified advertiser\b/gi,
+          ""
+        )
+        .replace(
+          /\badvertiser\b/gi,
+          ""
+        )
+        .replace(
+          /\bverified\b/gi,
+          ""
+        )
+        .replace(
+          /\s+/g,
+          " "
+        )
+        .trim();
+
+    /*
+     * Nếu lấy nguyên card dài thì lấy phần đầu.
+     */
+    if (value.length > 140) {
+      value =
+        value
+          .split(/[|•·\n]/g)
+          .map(normalizeText)
+          .filter(Boolean)[0] || "";
+    }
+
+    if (!value) continue;
+
+    if (isNoiseText(value)) {
+      continue;
+    }
+
+    if (
+      /^AR[A-Z0-9_-]+$/i.test(value)
+    ) {
+      continue;
+    }
+
+    if (
+      /^https?:\/\//i.test(value)
+    ) {
+      continue;
+    }
+
+    return value;
   }
 
-  /*
-   * Reject obvious bad names.
-   */
-  if (
-    value.length > 180
-  ) {
-    return "";
-  }
-
-  return value;
+  return "";
 }
 
 /* =========================================================
-   PARSE ADVERTISERS
+   PARSE DOMAIN -> ADVERTISERS
 ========================================================= */
 
 async function parseAdvertisers(
   page: Page,
   seedDomain: string
 ): Promise<{
-  advertisers:
-    AdvertiserRow[];
-
-  diagnostics:
-    DomCandidate[];
+  advertisers: AdvertiserRow[];
+  diagnostics: DomCandidate[];
 }> {
   const candidates =
-    await collectPageCandidates(
-      page
-    );
+    await collectPageCandidates(page);
 
   type TempAdvertiser = {
     name: string;
-    id?: string;
-
+    id: string;
     count: number;
-
     dates: string[];
-
     samples: string[];
   };
 
-  const map =
+  const advertiserMap =
     new Map<
       string,
       TempAdvertiser
     >();
 
-  for (
-    const candidate
-    of candidates
-  ) {
+  for (const candidate of candidates) {
     const combined =
       normalizeText(
         [
@@ -597,98 +512,56 @@ async function parseAdvertisers(
           candidate.href,
           candidate.ariaLabel,
           candidate.parentText,
-        ].join(
-          " "
-        )
+        ].join(" ")
       );
 
-    const lower =
-      combined.toLowerCase();
-
+    /*
+     * Chỉ chấp nhận record có AR ID thật.
+     */
     const advertiserId =
       extractAdvertiserId(
         combined
       );
 
-    /*
-     * Candidate must contain an advertiser
-     * indicator or advertiser ID.
-     */
-    const looksRelevant =
-      !!advertiserId ||
-      lower.includes(
-        "advertiser"
-      );
-
-    if (
-      !looksRelevant
-    ) {
+    if (!advertiserId) {
       continue;
     }
 
     /*
-     * Prefer visible text first.
+     * Phải liên quan advertiser URL thật của Transparency.
      */
-    let advertiserName =
-      cleanAdvertiserName(
-        candidate.text || "",
+    const href =
+      candidate.href || "";
+
+    const validAdvertiserRecord =
+      href.includes(
+        "adstransparency.google.com/advertiser/"
+      ) ||
+      combined.includes(
+        "/advertiser/"
+      );
+
+    if (
+      !validAdvertiserRecord
+    ) {
+      continue;
+    }
+
+    const advertiserName =
+      extractAdvertiserName(
+        candidate,
         advertiserId
       );
 
-    /*
-     * If candidate itself has no usable name,
-     * try surrounding parent card text.
-     */
-    if (
-      !advertiserName
-    ) {
-      advertiserName =
-        cleanAdvertiserName(
-          candidate.parentText ||
-            "",
-          advertiserId
-        );
-    }
-
-    /*
-     * If name is still empty,
-     * temporarily keep the ID.
-     *
-     * Diagnostics will let us map
-     * the exact DOM next.
-     */
-    if (
-      !advertiserName &&
-      advertiserId
-    ) {
-      advertiserName =
-        advertiserId;
-    }
-
-    if (
-      !advertiserName &&
-      !advertiserId
-    ) {
-      continue;
-    }
-
-    const key =
-      advertiserId ||
-      advertiserName.toLowerCase();
-
     const dates =
-      extractDates(
-        combined
-      );
+      extractDates(combined);
 
     const current =
-      map.get(
-        key
+      advertiserMap.get(
+        advertiserId
       );
 
-    if (
-      current
-    ) {
+    if (current) {
       current.count += 1;
 
       current.dates.push(
@@ -696,8 +569,7 @@ async function parseAdvertisers(
       );
 
       if (
-        current.samples.length <
-        5
+        current.samples.length < 5
       ) {
         current.samples.push(
           combined.slice(
@@ -708,14 +580,15 @@ async function parseAdvertisers(
       }
 
       /*
-       * Upgrade name if previous value
-       * was just advertiser ID.
+       * Nếu lần đầu chưa lấy được name,
+       * dùng name tốt hơn ở candidate sau.
        */
       if (
-        current.name ===
-          current.id &&
-        advertiserName !==
-          advertiserId
+        (
+          !current.name ||
+          current.name === advertiserId
+        ) &&
+        advertiserName
       ) {
         current.name =
           advertiserName;
@@ -724,13 +597,12 @@ async function parseAdvertisers(
       continue;
     }
 
-    map.set(
-      key,
+    advertiserMap.set(
+      advertiserId,
       {
         name:
           advertiserName ||
-          advertiserId ||
-          "Unknown Advertiser",
+          advertiserId,
 
         id:
           advertiserId,
@@ -756,25 +628,38 @@ async function parseAdvertisers(
 
   for (
     const item
-    of map.values()
+    of advertiserMap.values()
   ) {
     const uniqueDates =
-      [
-        ...new Set(
-          item.dates
-        ),
-      ].sort();
+      [...new Set(item.dates)]
+        .sort();
+
+    let name =
+      normalizeText(item.name);
+
+    /*
+     * Ví dụ:
+     * "Comfrt LLC Verified"
+     * -> "Comfrt LLC"
+     */
+    name =
+      name
+        .replace(
+          /\s+Verified$/i,
+          ""
+        )
+        .trim();
 
     const classification =
       classifyAdvertiser(
-        item.name,
+        name,
         seedDomain,
         item.count
       );
 
     advertisers.push({
       advertiser_name:
-        item.name,
+        name,
 
       advertiser_id:
         item.id,
@@ -783,15 +668,12 @@ async function parseAdvertisers(
         item.count,
 
       first_seen:
-        uniqueDates.length
-          ? uniqueDates[0]
-          : undefined,
+        uniqueDates[0],
 
       last_seen:
         uniqueDates.length
           ? uniqueDates[
-              uniqueDates.length -
-                1
+              uniqueDates.length - 1
             ]
           : undefined,
 
@@ -807,51 +689,32 @@ async function parseAdvertisers(
   }
 
   advertisers.sort(
-    (
-      a,
-      b
-    ) =>
+    (a, b) =>
       b.text_ads_count -
       a.text_ads_count
   );
 
   /*
-   * Keep the most useful DOM samples.
+   * Debug chỉ giữ candidate có AR ID thật.
    */
   const diagnostics =
     candidates
-      .filter(
-        (
-          item
-        ) => {
-          const value =
-            normalizeText(
-              [
-                item.text,
-                item.href,
-                item.ariaLabel,
-                item.parentText,
-              ].join(
-                " "
-              )
-            );
-
-          return (
-            value
-              .toLowerCase()
-              .includes(
-                "advertiser"
-              ) ||
-            /AR[A-Z0-9_-]{5,}/i.test(
-              value
-            )
+      .filter(candidate => {
+        const combined =
+          normalizeText(
+            [
+              candidate.text,
+              candidate.href,
+              candidate.ariaLabel,
+              candidate.parentText,
+            ].join(" ")
           );
-        }
-      )
-      .slice(
-        0,
-        80
-      );
+
+        return !!extractAdvertiserId(
+          combined
+        );
+      })
+      .slice(0, 100);
 
   return {
     advertisers,
@@ -860,7 +723,7 @@ async function parseAdvertisers(
 }
 
 /* =========================================================
-   DEBUG LOGGING
+   DEBUG
 ========================================================= */
 
 function debugDomainSearch(
@@ -885,8 +748,7 @@ function debugDomainSearch(
 
   console.log(
     "COUNTRY:",
-    country ||
-      "anywhere"
+    country || "anywhere"
   );
 
   console.log(
@@ -927,8 +789,7 @@ function debugDomainSearch(
 }
 
 /* =========================================================
-   MAIN
-   MODE 1:
+   MODE 1
    DOMAIN -> ADVERTISERS
 ========================================================= */
 
@@ -975,8 +836,7 @@ export async function runGoogleAdsTransparency(
       await context.newPage();
 
     /*
-     * Direct DOMAIN query.
-     *
+     * DIRECT DOMAIN SEARCH.
      * TEXT ONLY.
      */
     const params =
@@ -1017,83 +877,52 @@ export async function runGoogleAdsTransparency(
       }
     );
 
-    /*
-     * Allow Google SPA to render.
-     */
     await page.waitForTimeout(
       5000
     );
 
     let body =
       await page
-        .locator(
-          "body"
-        )
+        .locator("body")
         .innerText()
-        .catch(
-          () => ""
-        );
+        .catch(() => "");
 
-    const initialBlock =
-      detectBlockState(
-        body
-      );
+    let block =
+      detectBlockState(body);
 
-    if (
-      initialBlock.status
-    ) {
+    if (block.status) {
       return {
-        ...initialBlock,
+        ...block,
         results: [],
       };
     }
 
-    /*
-     * Load more public cards.
-     */
     await expandResults(
       page
     );
 
     body =
       await page
-        .locator(
-          "body"
-        )
+        .locator("body")
         .innerText()
-        .catch(
-          () => ""
-        );
+        .catch(() => "");
 
-    const afterLoadBlock =
-      detectBlockState(
-        body
-      );
+    block =
+      detectBlockState(body);
 
-    if (
-      afterLoadBlock.status
-    ) {
+    if (block.status) {
       return {
-        ...afterLoadBlock,
+        ...block,
         results: [],
       };
     }
 
-    /*
-     * Parse DOMAIN -> Advertisers.
-     */
     const parsed =
       await parseAdvertisers(
         page,
         seed
       );
 
-    /*
-     * IMPORTANT DEBUG.
-     *
-     * This lets Railway Deploy Logs show
-     * exactly what Google rendered.
-     */
     debugDomainSearch(
       seed,
       country,
@@ -1102,19 +931,10 @@ export async function runGoogleAdsTransparency(
       parsed.diagnostics
     );
 
-    /*
-     * Current DiscoveryResult schema is
-     * domain-oriented.
-     *
-     * For now advertiser data stays in
-     * raw_payload until Mode 1 is verified.
-     */
     const results:
       DiscoveryResult[] =
       parsed.advertisers.map(
-        (
-          advertiser
-        ) => ({
+        advertiser => ({
           provider:
             "google_ads_transparency",
 
@@ -1179,18 +999,16 @@ export async function runGoogleAdsTransparency(
       );
 
     if (
-      results.length ===
-      0
+      results.length === 0
     ) {
       return {
         status:
           "manual_required",
 
         message:
-          "DOMAIN_SEARCH loaded successfully but no advertiser records were parsed. " +
-          `seed=${seed}; ` +
-          `url=${page.url()}; ` +
-          "See Railway Deploy Logs between SPY ADS DEBUG markers.",
+          "DOMAIN_SEARCH loaded but no valid advertiser records were parsed. " +
+          `seed=${seed}; url=${page.url()}. ` +
+          "Check Railway SPY ADS DEBUG logs.",
 
         results: [],
       };
@@ -1202,13 +1020,11 @@ export async function runGoogleAdsTransparency(
 
       message:
         `DOMAIN_SEARCH completed. ` +
-        `Found ${results.length} advertiser candidate(s) for ${seed}.`,
+        `Found ${results.length} valid advertiser(s) for ${seed}.`,
 
       results,
     };
-  } catch (
-    error
-  ) {
+  } catch (error) {
     console.error(
       "[SPY ADS] DOMAIN_SEARCH ERROR:",
       error
@@ -1227,24 +1043,16 @@ export async function runGoogleAdsTransparency(
       results: [],
     };
   } finally {
-    if (
-      context
-    ) {
+    if (context) {
       await context
         .close()
-        .catch(
-          () => {}
-        );
+        .catch(() => {});
     }
 
-    if (
-      browser
-    ) {
+    if (browser) {
       await browser
         .close()
-        .catch(
-          () => {}
-        );
+        .catch(() => {});
     }
   }
 }
