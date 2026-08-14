@@ -29,6 +29,30 @@ const MAX_PAGES = 100;
  */
 const ADVERTISER_BATCH_SIZE = 5;
 
+// V0.6.1 rate-limit protection
+const RPC_MAX_RETRIES = 6;
+const RPC_BASE_BACKOFF_MS = 2500;
+const RPC_MAX_BACKOFF_MS = 30000;
+const RPC_PAGE_DELAY_MS = 1800;
+const DOMAIN_PAGE_DELAY_MS = 1500;
+const ADVERTISER_BATCH_DELAY_MS = 4000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function retryDelayMs(attempt: number, retryAfterHeader?: string): number {
+  const retryAfterSeconds = Number(retryAfterHeader || "");
+  if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return Math.min(retryAfterSeconds * 1000, 60000);
+  }
+  const exponential = Math.min(
+    RPC_BASE_BACKOFF_MS * Math.pow(2, attempt),
+    RPC_MAX_BACKOFF_MS
+  );
+  return exponential + Math.floor(Math.random() * 750);
+}
+
 /* =========================================================
    TYPES
 ========================================================= */
@@ -778,7 +802,7 @@ async function captureInitialSearch(
     `${BASE_URL}?${params.toString()}`;
 
   console.log(
-    "[SPY ADS V0.6] DOMAIN:",
+    "[SPY ADS V0.6.1] DOMAIN:",
     url
   );
 
@@ -946,114 +970,73 @@ async function buildReplayHeaders(
 ========================================================= */
 
 async function requestRpcPage(
-  context:
-    BrowserContext,
-
-  endpoint:
-    string,
-
-  headers:
-    Record<
-      string,
-      string
-    >,
-
-  basePayload:
-    Record<
-      string,
-      any
-    >,
-
-  token?:
-    string
+  context: BrowserContext,
+  endpoint: string,
+  headers: Record<string, string>,
+  basePayload: Record<string, any>,
+  token?: string
 ): Promise<{
-  response:
-    APIResponse;
-
-  data:
-    any;
-
-  text:
-    string;
+  response: APIResponse;
+  data: any;
+  text: string;
 }> {
-  const payload =
-    JSON.parse(
-      JSON.stringify(
-        basePayload
-      )
-    );
+  const payload = JSON.parse(JSON.stringify(basePayload));
 
-  /*
-   * Confirmed pagination:
-   *
-   * request field "4"
-   * = previous response token.
-   */
-  if (
-    token
-  ) {
-    payload["4"] =
-      token;
+  if (token) {
+    payload["4"] = token;
   } else {
     delete payload["4"];
   }
 
-  const body =
-    new URLSearchParams();
+  const body = new URLSearchParams();
+  body.set("f.req", JSON.stringify(payload));
 
-  body.set(
-    "f.req",
-    JSON.stringify(
-      payload
-    )
-  );
+  let lastStatus = 0;
+  let lastText = "";
 
-  const response =
-    await context
-      .request
-      .post(
-        endpoint,
-        {
-          headers,
+  for (let attempt = 0; attempt <= RPC_MAX_RETRIES; attempt++) {
+    const response = await context.request.post(endpoint, {
+      headers,
+      data: body.toString(),
+    });
 
-          data:
-            body.toString(),
-        }
+    const text = await response.text();
+    lastStatus = response.status();
+    lastText = text;
+
+    if (response.ok()) {
+      const data = parseGoogleResponseText(text);
+      if (!data) {
+        throw new Error("Unable to parse SearchCreatives RPC response.");
+      }
+      return { response, data, text };
+    }
+
+    const retryable =
+      response.status() === 429 ||
+      response.status() === 408 ||
+      response.status() >= 500;
+
+    if (!retryable || attempt >= RPC_MAX_RETRIES) {
+      throw new Error(
+        `SearchCreatives HTTP ${response.status()}: ${text.slice(0, 500)}`
       );
+    }
 
-  const text =
-    await response
-      .text();
+    const retryAfter = response.headers()["retry-after"];
+    const waitMs = retryDelayMs(attempt, retryAfter);
 
-  if (
-    !response.ok()
-  ) {
-    throw new Error(
-      `SearchCreatives HTTP ${response.status()}: ${text.slice(
-        0,
-        500
-      )}`
+    console.warn(
+      `[SPY ADS V0.6.1] HTTP ${response.status()} - retry ` +
+      `${attempt + 1}/${RPC_MAX_RETRIES} after ${waitMs}ms`
     );
+
+    await sleep(waitMs);
   }
 
-  const data =
-    parseGoogleResponseText(
-      text
-    );
-
-  if (
-    !data
-  ) {
-    throw new Error(
-      "Unable to parse SearchCreatives RPC response."
-    );
-  }
-
-  return {
-    response,
-    data,
-    text,
-  };
+  throw new Error(
+    `SearchCreatives HTTP ${lastStatus}: ${lastText.slice(0, 500)}`
+  );
 }
 
 /* =========================================================
@@ -1127,7 +1110,7 @@ async function paginateRpc(
       before;
 
     console.log(
-      `[SPY ADS V0.6] ${label} PAGE ${pagesLoaded}: +${added}, total=${output.length}`
+      `[SPY ADS V0.6.1] ${label} PAGE ${pagesLoaded}: +${added}, total=${output.length}`
     );
 
     const nextToken =
@@ -1147,7 +1130,7 @@ async function paginateRpc(
       )
     ) {
       console.log(
-        `[SPY ADS V0.6] ${label}: repeated token, stop.`
+        `[SPY ADS V0.6.1] ${label}: repeated token, stop.`
       );
 
       break;
@@ -1163,13 +1146,7 @@ async function paginateRpc(
     /*
      * Avoid hammering provider.
      */
-    await new Promise(
-      resolve =>
-        setTimeout(
-          resolve,
-          550
-        )
-    );
+    await sleep(RPC_PAGE_DELAY_MS);
   }
 
   return pagesLoaded;
@@ -1939,13 +1916,7 @@ export async function runGoogleAdsTransparency(
           next.data
         );
 
-      await new Promise(
-        resolve =>
-          setTimeout(
-            resolve,
-            500
-          )
-      );
+      await sleep(DOMAIN_PAGE_DELAY_MS);
     }
 
     const advertisers =
@@ -1972,7 +1943,7 @@ export async function runGoogleAdsTransparency(
       );
 
     console.log(
-      "========== V0.6 STEP 1 =========="
+      "========== V0.6.1 STEP 1 =========="
     );
 
     console.log(
@@ -2039,7 +2010,7 @@ export async function runGoogleAdsTransparency(
         batches[index];
 
       console.log(
-        `[SPY ADS V0.6] Advertiser batch ${
+        `[SPY ADS V0.6.1] Advertiser batch ${
           index + 1
         }/${batches.length}: ${batch.length} advertiser(s)`
       );
@@ -2067,13 +2038,7 @@ export async function runGoogleAdsTransparency(
       /*
        * Be conservative between batches.
        */
-      await new Promise(
-        resolve =>
-          setTimeout(
-            resolve,
-            1000
-          )
-      );
+      await sleep(ADVERTISER_BATCH_DELAY_MS);
     }
 
     /* =====================================================
@@ -2088,7 +2053,7 @@ export async function runGoogleAdsTransparency(
       );
 
     console.log(
-      "========== SPY ADS V0.6 RESULT =========="
+      "========== SPY ADS V0.6.1 RESULT =========="
     );
 
     console.log(
@@ -2134,7 +2099,7 @@ export async function runGoogleAdsTransparency(
     );
 
     console.log(
-      "========== END SPY ADS V0.6 =========="
+      "========== END SPY ADS V0.6.1 =========="
     );
 
     /*
@@ -2171,7 +2136,7 @@ export async function runGoogleAdsTransparency(
 
           raw_payload: {
             mode:
-              "SPY_ADS_EXPANSION_V06",
+              "SPY_ADS_EXPANSION_V061",
 
             seed_domain:
               seed,
@@ -2226,7 +2191,7 @@ export async function runGoogleAdsTransparency(
         "completed",
 
       message:
-        `V0.6 completed. ` +
+        `V0.6.1 completed. ` +
         `${advertisers.length} advertiser(s) found from ${seed}; ` +
         `${expandableAdvertisers.length} expanded; ` +
         `${expansionCreatives.length} expansion creative(s); ` +
@@ -2238,7 +2203,7 @@ export async function runGoogleAdsTransparency(
     error
   ) {
     console.error(
-      "[SPY ADS V0.6 ERROR]",
+      "[SPY ADS V0.6.1 ERROR]",
       error
     );
 
