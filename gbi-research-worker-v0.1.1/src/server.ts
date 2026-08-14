@@ -97,8 +97,28 @@ function buildIngestPayload(
           raw?.advertiser_name ?? advertiser?.advertiser_name ?? undefined,
         domain,
         landing_url: raw?.landing_url ?? result?.source_url ?? undefined,
-        first_seen: result?.first_seen ?? raw?.first_seen ?? undefined,
-        last_seen: result?.last_seen ?? raw?.last_seen ?? undefined,
+        // Google Ads Transparency lifecycle timestamps.
+        ads_first_seen:
+          raw?.ads_first_seen ?? result?.first_seen ?? raw?.first_seen ?? undefined,
+        ads_last_seen:
+          raw?.ads_last_seen ?? result?.last_seen ?? raw?.last_seen ?? undefined,
+        ads_age_days:
+          raw?.ads_age_days ?? undefined,
+        currently_active:
+          raw?.currently_active ?? undefined,
+
+        // Backward-compatible aliases expected by the current ingest endpoint.
+        first_seen:
+          raw?.ads_first_seen ?? result?.first_seen ?? raw?.first_seen ?? undefined,
+        last_seen:
+          raw?.ads_last_seen ?? result?.last_seen ?? raw?.last_seen ?? undefined,
+
+        // Our own discovery/crawl timestamps are intentionally separate.
+        discovered_at:
+          raw?.crawler_discovered_at ?? result?.observed_at ?? finishedAt ?? new Date().toISOString(),
+        last_crawled_at:
+          raw?.crawler_last_checked_at ?? finishedAt ?? new Date().toISOString(),
+
         activity_status:
           result?.activity_status ?? raw?.activity_status ?? "UNKNOWN",
         search_creative_count:
@@ -208,7 +228,7 @@ app.get("/health", (_req, res) =>
   res.json({
     ok: true,
     service: "gbi-research-worker",
-    version: "0.1.2",
+    version: "0.1.3",
     ingest_configured: Boolean(ingestUrl && ingestToken),
     time: new Date().toISOString(),
   })
@@ -322,7 +342,7 @@ process.on("uncaughtException", (err) =>
 
 app.listen(port, "0.0.0.0", () =>
   console.log(
-    `GBI Research Worker v0.1.2 listening on :${port} | ingest=${Boolean(
+    `GBI Research Worker v0.1.3 listening on :${port} | ingest=${Boolean(
       ingestUrl && ingestToken
     )}`
   )
