@@ -27,9 +27,13 @@ const MAX_PAGES = 100;
  *
  * Browser request observed 10 advertisers/batch.
  */
-const ADVERTISER_BATCH_SIZE = 5;
+const ADVERTISER_BATCH_SIZE = 1;
+const MAX_ADVERTISERS_TO_EXPAND = 1;
+const MAX_ADVERTISER_PAGES = 2;
+const MAX_PREVIEWS_TO_FETCH = 30;
+const PREVIEW_FETCH_DELAY_MS = 450;
 
-// V0.6.1 rate-limit protection
+// V0.6.2 rate-limit protection
 const RPC_MAX_RETRIES = 6;
 const RPC_BASE_BACKOFF_MS = 2500;
 const RPC_MAX_BACKOFF_MS = 30000;
@@ -63,7 +67,8 @@ type CapturedCreative = {
 
   creative_id: string;
 
-  domain: string;
+  domain?: string;
+  preview_url?: string;
 
   format_code?: number;
 
@@ -461,6 +466,156 @@ function parseGoogleResponseText(
 }
 
 /* =========================================================
+   PREVIEW HELPERS (TEXT ADS)
+========================================================= */
+
+function findPreviewUrl(value: any): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+
+  const direct = value?.["3"]?.["1"]?.["4"];
+  if (
+    typeof direct === "string" &&
+    direct.includes("displayads-formats.googleusercontent.com/ads/preview/content.js")
+  ) {
+    return direct;
+  }
+
+  return undefined;
+}
+
+function isLikelyDisplayDomain(domain: string): boolean {
+  const value = normalizeDomain(domain);
+  if (!value || isInfrastructureDomain(value)) return false;
+
+  if (
+    value.startsWith("com.google.") ||
+    value.startsWith("object.") ||
+    value.startsWith("array.") ||
+    value.startsWith("string.") ||
+    value.startsWith("function.") ||
+    value.startsWith("window.") ||
+    value.startsWith("document.")
+  ) {
+    return false;
+  }
+
+  const labels = value.split(".");
+  if (labels.length < 2 || labels.length > 6) return false;
+
+  const tld = labels[labels.length - 1];
+  const codeLikeTlds = new Set([
+    "includes", "prototype", "transform", "proto", "call",
+    "apply", "bind", "create", "defineproperty", "entries", "values"
+  ]);
+
+  if (codeLikeTlds.has(tld)) return false;
+  return true;
+}
+
+function extractCandidateDomainsFromPreview(text: string): string[] {
+  const candidates = new Set<string>();
+
+  // The text-ad renderer stores visible domains in escaped quoted strings,
+  // e.g. \\x22enter.converge.ai/\\x22.
+  const escapedQuoted = /\\x22((?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/.*?)?)\\x22/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = escapedQuoted.exec(text)) !== null) {
+    const domain = normalizeDomain(match[1]);
+    if (isLikelyDisplayDomain(domain)) {
+      candidates.add(domain);
+    }
+  }
+
+  // Defensive fallback for renderer variants that expose a normal URL/domain.
+  const generic = /(?:https?:\/\/)?(?:www\.)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?:[\/?#:\s"'<>]|$)/gi;
+  while ((match = generic.exec(text)) !== null) {
+    const domain = normalizeDomain(match[1]);
+    if (isLikelyDisplayDomain(domain)) {
+      candidates.add(domain);
+    }
+  }
+
+  return [...candidates];
+}
+
+function scorePreviewDomain(domain: string, text: string): number {
+  let score = 0;
+  const escaped = domain.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  if (new RegExp(`\\\\x22(?:https?:\\\\/\\\\/)?(?:www\\\\.)?${escaped}(?:\\\\/[^\\\\x22]*)?\\\\x22`, "i").test(text)) {
+    score += 10;
+  }
+
+  if (text.toLowerCase().includes(domain.toLowerCase())) score += 2;
+  return score;
+}
+
+async function fetchPreviewDomain(
+  context: BrowserContext,
+  previewUrl: string
+): Promise<string | undefined> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const response = await context.request.get(previewUrl, {
+      headers: {
+        accept: "*/*",
+        referer: BASE_URL,
+      },
+    });
+
+    const body = await response.text();
+
+    if (response.ok()) {
+      const domains = extractCandidateDomainsFromPreview(body)
+        .map(domain => ({ domain, score: scorePreviewDomain(domain, body) }))
+        .sort((a, b) => b.score - a.score);
+
+      return domains[0]?.domain;
+    }
+
+    if (response.status() !== 429 && response.status() < 500) {
+      return undefined;
+    }
+
+    await sleep(Math.min(1500 * Math.pow(2, attempt), 10000));
+  }
+
+  return undefined;
+}
+
+async function enrichTextCreativesFromPreviews(
+  context: BrowserContext,
+  creatives: CapturedCreative[]
+): Promise<number> {
+  let fetched = 0;
+  let resolved = 0;
+
+  for (const creative of creatives) {
+    if (fetched >= MAX_PREVIEWS_TO_FETCH) break;
+    if (creative.domain || !creative.preview_url) continue;
+
+    fetched += 1;
+
+    const domain = await fetchPreviewDomain(context, creative.preview_url);
+    if (domain) {
+      creative.domain = domain;
+      resolved += 1;
+      console.log(
+        `[SPY ADS V0.6.2] PREVIEW ${fetched}: ${creative.creative_id} -> ${domain}`
+      );
+    }
+
+    await sleep(PREVIEW_FETCH_DELAY_MS);
+  }
+
+  console.log(
+    `[SPY ADS V0.6.2] PREVIEWS FETCHED=${fetched}, DOMAINS RESOLVED=${resolved}`
+  );
+
+  return resolved;
+}
+
+/* =========================================================
    CREATIVE EXTRACTION
 ========================================================= */
 
@@ -534,6 +689,9 @@ function extractCreativesRecursive(
         )
       : undefined;
 
+  const previewUrl =
+    findPreviewUrl(value);
+
   /*
    * Strong signature observed in
    * SearchCreatives response.
@@ -548,7 +706,7 @@ function extractCreativesRecursive(
       "CR"
     ) &&
     advertiserName &&
-    domain
+    (domain || previewUrl)
   ) {
     if (
       !seenCreativeIds.has(
@@ -570,6 +728,8 @@ function extractCreativesRecursive(
           creativeId,
 
         domain,
+        preview_url:
+          previewUrl,
 
         format_code:
           typeof value["4"] ===
@@ -802,7 +962,7 @@ async function captureInitialSearch(
     `${BASE_URL}?${params.toString()}`;
 
   console.log(
-    "[SPY ADS V0.6.1] DOMAIN:",
+    "[SPY ADS V0.6.2] DOMAIN:",
     url
   );
 
@@ -1027,7 +1187,7 @@ async function requestRpcPage(
     const waitMs = retryDelayMs(attempt, retryAfter);
 
     console.warn(
-      `[SPY ADS V0.6.1] HTTP ${response.status()} - retry ` +
+      `[SPY ADS V0.6.2] HTTP ${response.status()} - retry ` +
       `${attempt + 1}/${RPC_MAX_RETRIES} after ${waitMs}ms`
     );
 
@@ -1069,7 +1229,10 @@ async function paginateRpc(
     Set<string>,
 
   label:
-    string
+    string,
+
+  maxPages:
+    number = MAX_PAGES
 ): Promise<number> {
   const seenTokens =
     new Set<string>();
@@ -1082,7 +1245,7 @@ async function paginateRpc(
 
   while (
     pagesLoaded <
-    MAX_PAGES
+    maxPages
   ) {
     const before =
       output.length;
@@ -1110,7 +1273,7 @@ async function paginateRpc(
       before;
 
     console.log(
-      `[SPY ADS V0.6.1] ${label} PAGE ${pagesLoaded}: +${added}, total=${output.length}`
+      `[SPY ADS V0.6.2] ${label} PAGE ${pagesLoaded}: +${added}, total=${output.length}`
     );
 
     const nextToken =
@@ -1130,7 +1293,7 @@ async function paginateRpc(
       )
     ) {
       console.log(
-        `[SPY ADS V0.6.1] ${label}: repeated token, stop.`
+        `[SPY ADS V0.6.2] ${label}: repeated token, stop.`
       );
 
       break;
@@ -1311,6 +1474,7 @@ function buildAdvertiserSummaries(
     of creatives
   ) {
     if (
+      !creative.domain ||
       normalizeDomain(
         creative.domain
       ) !==
@@ -1525,6 +1689,10 @@ function buildDomainSummaries(
     const creative
     of creatives
   ) {
+    if (!creative.domain) {
+      continue;
+    }
+
     const domain =
       normalizeDomain(
         creative.domain
@@ -1943,7 +2111,7 @@ export async function runGoogleAdsTransparency(
       );
 
     console.log(
-      "========== V0.6.1 STEP 1 =========="
+      "========== V0.6.2 STEP 1 =========="
     );
 
     console.log(
@@ -1978,6 +2146,7 @@ export async function runGoogleAdsTransparency(
 
     const advertiserIds =
       expandableAdvertisers
+        .slice(0, MAX_ADVERTISERS_TO_EXPAND)
         .map(
           advertiser =>
             advertiser
@@ -2010,7 +2179,7 @@ export async function runGoogleAdsTransparency(
         batches[index];
 
       console.log(
-        `[SPY ADS V0.6.1] Advertiser batch ${
+        `[SPY ADS V0.6.2] Advertiser batch ${
           index + 1
         }/${batches.length}: ${batch.length} advertiser(s)`
       );
@@ -2029,7 +2198,8 @@ export async function runGoogleAdsTransparency(
           payload,
           expansionCreatives,
           expansionSeenIds,
-          `ADV-BATCH-${index + 1}`
+          `ADV-BATCH-${index + 1}`,
+          MAX_ADVERTISER_PAGES
         );
 
       advertiserPages +=
@@ -2040,6 +2210,17 @@ export async function runGoogleAdsTransparency(
        */
       await sleep(ADVERTISER_BATCH_DELAY_MS);
     }
+
+    /* =====================================================
+       STEP 2.5
+       TEXT PREVIEW -> DISPLAY DOMAIN
+    ===================================================== */
+
+    const previewDomainsResolved =
+      await enrichTextCreativesFromPreviews(
+        context,
+        expansionCreatives
+      );
 
     /* =====================================================
        STEP 3
@@ -2053,7 +2234,7 @@ export async function runGoogleAdsTransparency(
       );
 
     console.log(
-      "========== SPY ADS V0.6.1 RESULT =========="
+      "========== SPY ADS V0.6.2 RESULT =========="
     );
 
     console.log(
@@ -2099,7 +2280,7 @@ export async function runGoogleAdsTransparency(
     );
 
     console.log(
-      "========== END SPY ADS V0.6.1 =========="
+      "========== END SPY ADS V0.6.2 =========="
     );
 
     /*
@@ -2136,7 +2317,7 @@ export async function runGoogleAdsTransparency(
 
           raw_payload: {
             mode:
-              "SPY_ADS_EXPANSION_V061",
+              "SPY_ADS_EXPANSION_V062_TEST",
 
             seed_domain:
               seed,
@@ -2158,6 +2339,9 @@ export async function runGoogleAdsTransparency(
 
             expansion_creatives_total:
               expansionCreatives.length,
+
+            preview_domains_resolved:
+              previewDomainsResolved,
 
             discovered_domain:
               domain.domain,
@@ -2191,9 +2375,9 @@ export async function runGoogleAdsTransparency(
         "completed",
 
       message:
-        `V0.6.1 completed. ` +
+        `V0.6.2 completed. ` +
         `${advertisers.length} advertiser(s) found from ${seed}; ` +
-        `${expandableAdvertisers.length} expanded; ` +
+        `${advertiserIds.length} advertiser(s) tested; ` +
         `${expansionCreatives.length} expansion creative(s); ` +
         `${discoveredDomains.length} new unique domain(s).`,
 
@@ -2203,7 +2387,7 @@ export async function runGoogleAdsTransparency(
     error
   ) {
     console.error(
-      "[SPY ADS V0.6.1 ERROR]",
+      "[SPY ADS V0.6.2 ERROR]",
       error
     );
 
