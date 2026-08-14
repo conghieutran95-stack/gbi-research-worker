@@ -28,12 +28,12 @@ const MAX_PAGES = 100;
  * Browser request observed 10 advertisers/batch.
  */
 const ADVERTISER_BATCH_SIZE = 1;
-const MAX_ADVERTISERS_TO_EXPAND = 50;
+const MAX_ADVERTISERS_TO_EXPAND = 10;
 const MAX_ADVERTISER_PAGES = 10;
 const MAX_PREVIEWS_TO_FETCH = 600;
 const PREVIEW_FETCH_DELAY_MS = 500;
 
-// V0.7.1 rate-limit protection
+// V0.7.2 rate-limit protection
 const RPC_MAX_RETRIES = 2;
 const RPC_BASE_BACKOFF_MS = 2500;
 const RPC_MAX_BACKOFF_MS = 30000;
@@ -52,9 +52,9 @@ const ADVERTISER_SOFT_PAGE_CAP = 5;
 const ADVERTISER_HARD_PAGE_CAP = 10;
 const LOW_YIELD_MIN_NEW_DOMAINS = 3;
 
-const ADVERTISER_CHUNK_SIZE = 15;
-const CHUNK_COOLDOWN_MS = 90000;
-const CHUNK_COOLDOWN_JITTER_MS = 20000;
+const ADVERTISER_CHUNK_SIZE = 10;
+const CHUNK_COOLDOWN_MS = 0;
+const CHUNK_COOLDOWN_JITTER_MS = 0;
 
 const GLOBAL_429_THRESHOLD = 3;
 const GLOBAL_COOLDOWN_STEPS_MS = [
@@ -62,7 +62,7 @@ const GLOBAL_COOLDOWN_STEPS_MS = [
   180000,
   240000,
 ];
-const MAX_DEFERRED_RETRY_PASSES = 1;
+const MAX_DEFERRED_RETRY_PASSES = 0;
 
 
 
@@ -195,7 +195,7 @@ async function waitForGlobalCooldown(
 
   if (remaining > 0) {
     console.warn(
-      `[SPY ADS V0.7.1.1] RATE_LIMIT_COOLDOWN wait=${Math.ceil(remaining / 1000)}s`
+      `[SPY ADS V0.7.2] RATE_LIMIT_COOLDOWN wait=${Math.ceil(remaining / 1000)}s`
     );
     await sleep(remaining);
   }
@@ -254,7 +254,7 @@ function register429(
   controller.consecutive429 = 0;
 
   console.warn(
-    `[SPY ADS V0.7.1.1] CIRCUIT_BREAKER_OPEN cooldown=${Math.ceil(cooldownMs / 1000)}s level=${level + 1}`
+    `[SPY ADS V0.7.2] CIRCUIT_BREAKER_OPEN cooldown=${Math.ceil(cooldownMs / 1000)}s level=${level + 1}`
   );
 
   return true;
@@ -314,6 +314,36 @@ function activityFromDates(
     days_running,
     activity_status,
   };
+}
+
+
+type SeedCursor = {
+  domain: string;
+  offset: number;
+};
+
+function parseSeedCursor(seed: string): SeedCursor {
+  const raw = seed.trim();
+  const match = raw.match(/^(.*)::(\d+)$/);
+
+  if (!match) {
+    return {
+      domain: raw,
+      offset: 0,
+    };
+  }
+
+  return {
+    domain: match[1].trim(),
+    offset: Math.max(0, Number(match[2]) || 0),
+  };
+}
+
+function makeSeedCursor(
+  domain: string,
+  offset: number
+): string {
+  return `${domain}::${Math.max(0, offset)}`;
 }
 
 /* =========================================================
@@ -796,7 +826,7 @@ async function enrichTextCreativesFromPreviews(
       creative.domain = domain;
       resolved += 1;
       console.log(
-        `[SPY ADS V0.7.1] PREVIEW ${fetched}: ${creative.creative_id} -> ${domain}`
+        `[SPY ADS V0.7.2] PREVIEW ${fetched}: ${creative.creative_id} -> ${domain}`
       );
     }
 
@@ -804,7 +834,7 @@ async function enrichTextCreativesFromPreviews(
   }
 
   console.log(
-    `[SPY ADS V0.7.1] PREVIEWS FETCHED=${fetched}, DOMAINS RESOLVED=${resolved}`
+    `[SPY ADS V0.7.2] PREVIEWS FETCHED=${fetched}, DOMAINS RESOLVED=${resolved}`
   );
 
   return resolved;
@@ -1101,7 +1131,7 @@ async function captureInitialSearch(
 
   const url = `${BASE_URL}?${params.toString()}`;
 
-  console.log("[SPY ADS V0.7.1] DOMAIN:", url);
+  console.log("[SPY ADS V0.7.2] DOMAIN:", url);
 
   let capturedRequest: Request | undefined;
   let capturedResponse: Response | undefined;
@@ -1113,7 +1143,7 @@ async function captureInitialSearch(
       !capturedRequest
     ) {
       capturedRequest = request;
-      console.log("[SPY ADS V0.7.1] SearchCreatives REQUEST captured");
+      console.log("[SPY ADS V0.7.2] SearchCreatives REQUEST captured");
     }
   };
 
@@ -1124,7 +1154,7 @@ async function captureInitialSearch(
       !capturedResponse
     ) {
       capturedResponse = response;
-      console.log("[SPY ADS V0.7.1] SearchCreatives RESPONSE captured");
+      console.log("[SPY ADS V0.7.2] SearchCreatives RESPONSE captured");
     }
   };
 
@@ -1162,7 +1192,7 @@ async function captureInitialSearch(
 
     if (!capturedResponse) {
       console.warn(
-        `[SPY ADS V0.7.1] Request captured but response missing for ${seed}.`
+        `[SPY ADS V0.7.2] Request captured but response missing for ${seed}.`
       );
 
       const response = await capturedRequest.response().catch(() => null);
@@ -1178,7 +1208,7 @@ async function captureInitialSearch(
       );
     }
 
-    console.log(`[SPY ADS V0.7.1] INITIAL CAPTURE OK: ${seed}`);
+    console.log(`[SPY ADS V0.7.2] INITIAL CAPTURE OK: ${seed}`);
 
     return {
       request: capturedRequest,
@@ -1333,7 +1363,19 @@ async function requestRpcPage(
   let lastStatus = 0;
 
   for (let attempt = 0; attempt <= RPC_MAX_RETRIES; attempt++) {
-    await waitForGlobalCooldown(rateLimitController);
+    if (
+      rateLimitController &&
+      rateLimitController.cooldownUntil > Date.now()
+    ) {
+      const remainingSeconds =
+        Math.ceil(
+          (rateLimitController.cooldownUntil - Date.now()) / 1000
+        );
+
+      throw new RateLimitedError(
+        `Global rate limit active. Retry after about ${remainingSeconds}s.`
+      );
+    }
 
     const response = await context.request.post(endpoint, {
       headers,
@@ -1360,6 +1402,7 @@ async function requestRpcPage(
     }
 
     const status = response.status();
+
     const retryable =
       status === 429 ||
       status === 408 ||
@@ -1372,7 +1415,7 @@ async function requestRpcPage(
         register429(rateLimitController);
 
       console.warn(
-        `[SPY ADS V0.7.1.1] HTTP 429 attempt=${attempt + 1}/${RPC_MAX_RETRIES + 1}`
+        `[SPY ADS V0.7.2] HTTP 429 attempt=${attempt + 1}/${RPC_MAX_RETRIES + 1}`
       );
 
       if (circuitOpened) {
@@ -1382,8 +1425,9 @@ async function requestRpcPage(
       }
     } else if (retryable) {
       onRetry?.(status);
+
       console.warn(
-        `[SPY ADS V0.7.1.1] HTTP ${status} attempt=${attempt + 1}/${RPC_MAX_RETRIES + 1}`
+        `[SPY ADS V0.7.2] HTTP ${status} attempt=${attempt + 1}/${RPC_MAX_RETRIES + 1}`
       );
     }
 
@@ -1399,17 +1443,27 @@ async function requestRpcPage(
       );
     }
 
-    const retryAfter = response.headers()["retry-after"];
-    const waitMs = retryDelayMs(attempt, retryAfter);
+    const retryAfter =
+      response.headers()["retry-after"];
+
+    const waitMs =
+      Math.min(
+        retryDelayMs(attempt, retryAfter),
+        12000
+      );
 
     await sleep(waitMs);
   }
 
   if (lastStatus === 429) {
-    throw new RateLimitedError("SearchCreatives rate-limited.");
+    throw new RateLimitedError(
+      "SearchCreatives rate-limited."
+    );
   }
 
-  throw new Error(`SearchCreatives HTTP ${lastStatus}`);
+  throw new Error(
+    `SearchCreatives HTTP ${lastStatus}`
+  );
 }
 
 /* =========================================================
@@ -1530,7 +1584,7 @@ async function paginateRpc(
     pagesLoaded += 1;
 
     console.log(
-      `[SPY ADS V0.7.1.1] ${label} PAGE ${pagesLoaded}: ` +
+      `[SPY ADS V0.7.2] ${label} PAGE ${pagesLoaded}: ` +
       `text=${pageTextCreatives}, ` +
       `resolved=${pageResolved}, ` +
       `new_domains=${pageNewDomains}, ` +
@@ -1547,7 +1601,7 @@ async function paginateRpc(
       earlyStopped = true;
 
       console.log(
-        `[SPY ADS V0.7.1.1] ${label}: EARLY_STOP no_new_domains=${EARLY_STOP_NO_NEW_DOMAIN_PAGES}_pages`
+        `[SPY ADS V0.7.2] ${label}: EARLY_STOP no_new_domains=${EARLY_STOP_NO_NEW_DOMAIN_PAGES}_pages`
       );
       break;
     }
@@ -1563,7 +1617,7 @@ async function paginateRpc(
       earlyStopped = true;
 
       console.log(
-        `[SPY ADS V0.7.1.1] ${label}: LOW_YIELD_STOP pages=${pagesLoaded} domains=${seenDomains.size}`
+        `[SPY ADS V0.7.2] ${label}: LOW_YIELD_STOP pages=${pagesLoaded} domains=${seenDomains.size}`
       );
       break;
     }
@@ -1576,7 +1630,7 @@ async function paginateRpc(
 
     if (seenTokens.has(nextToken)) {
       console.log(
-        `[SPY ADS V0.7.1.1] ${label}: repeated token, stop.`
+        `[SPY ADS V0.7.2] ${label}: repeated token, stop.`
       );
       break;
     }
@@ -2242,6 +2296,15 @@ export async function runGoogleAdsTransparency(
   let context:
     BrowserContext | undefined;
 
+  const cursor =
+    parseSeedCursor(seed);
+
+  const seedDomain =
+    cursor.domain;
+
+  const startOffset =
+    cursor.offset;
+
   const region =
     country ||
     "anywhere";
@@ -2297,7 +2360,7 @@ export async function runGoogleAdsTransparency(
     const initial =
       await captureInitialSearch(
         context,
-        seed,
+        seedDomain,
         region
       );
 
@@ -2412,7 +2475,7 @@ export async function runGoogleAdsTransparency(
     const advertisers =
       buildAdvertiserSummaries(
         domainCreatives,
-        seed
+        seedDomain
       );
 
     /*
@@ -2433,12 +2496,12 @@ export async function runGoogleAdsTransparency(
       );
 
     console.log(
-      "========== V0.7.1 STEP 1 =========="
+      "========== V0.7.2 STEP 1 =========="
     );
 
     console.log(
       "SEED DOMAIN:",
-      seed
+      seedDomain
     );
 
     console.log(
@@ -2475,7 +2538,7 @@ export async function runGoogleAdsTransparency(
     skippedBrandAdvertisers =
       skippedBrands.length;
 
-    const rankedAdvertisers =
+    const allRankedAdvertisers =
       expandableAdvertisers
         .filter(
           advertiser =>
@@ -2483,11 +2546,6 @@ export async function runGoogleAdsTransparency(
         )
         .slice()
         .sort((a, b) => {
-          /*
-           * Discovery-first ranking:
-           * prioritize advertisers with enough source evidence,
-           * but do not reward gigantic creative counts without limit.
-           */
           const aScore =
             Math.min(a.creative_count, 50);
 
@@ -2495,19 +2553,24 @@ export async function runGoogleAdsTransparency(
             Math.min(b.creative_count, 50);
 
           return bScore - aScore;
-        })
-        .slice(0, MAX_ADVERTISERS_TO_EXPAND);
+        });
+
+    const safeStartOffset =
+      Math.min(
+        startOffset,
+        allRankedAdvertisers.length
+      );
+
+    const rankedAdvertisers =
+      allRankedAdvertisers.slice(
+        safeStartOffset,
+        safeStartOffset + MAX_ADVERTISERS_TO_EXPAND
+      );
 
     const advertiserIds =
       rankedAdvertisers.map(
         advertiser =>
           advertiser.advertiser_id
-      );
-
-    const batches =
-      chunkArray(
-        advertiserIds,
-        ADVERTISER_BATCH_SIZE
       );
 
     const expansionCreatives:
@@ -2520,34 +2583,28 @@ export async function runGoogleAdsTransparency(
     let totalAdvertiserPages =
       0;
 
-    type AdvertiserWorkItem = {
-      advertiser: AdvertiserSummary;
-      retryPass: number;
-    };
+    let rateLimitedStop = false;
+    let nextOffset = safeStartOffset;
+    let processedAdvertisers = 0;
 
-    const workQueue: AdvertiserWorkItem[] =
-      rankedAdvertisers.map(
-        advertiser => ({
-          advertiser,
-          retryPass: 0,
-        })
-      );
+    for (
+      let index = 0;
+      index < rankedAdvertisers.length;
+      index++
+    ) {
+      const advertiser =
+        rankedAdvertisers[index];
 
-    let processedInChunk = 0;
-    let workIndex = 0;
+      const pageCap =
+        advertiserPageCap(advertiser);
 
-    while (workIndex < workQueue.length) {
-      const item = workQueue[workIndex];
-      workIndex += 1;
-
-      const advertiser = item.advertiser;
-      const pageCap = advertiserPageCap(advertiser);
+      const absoluteIndex =
+        safeStartOffset + index;
 
       console.log(
-        `[SPY ADS V0.7.1.1] Advertiser ${workIndex}/${workQueue.length}: ` +
+        `[SPY ADS V0.7.2] Advertiser ${absoluteIndex + 1}/${allRankedAdvertisers.length}: ` +
         `${advertiser.advertiser_name} (${advertiser.advertiser_id}) ` +
-        `source_creatives=${advertiser.creative_count}, ` +
-        `page_cap=${pageCap}, retry_pass=${item.retryPass}`
+        `source_creatives=${advertiser.creative_count}, page_cap=${pageCap}`
       );
 
       const payload =
@@ -2565,9 +2622,9 @@ export async function runGoogleAdsTransparency(
             payload,
             expansionCreatives,
             expansionSeenIds,
-            `ADV-${workIndex}`,
+            `ADV-${absoluteIndex + 1}`,
             pageCap,
-            seed,
+            seedDomain,
             status => {
               totalRpcRetries += 1;
 
@@ -2579,74 +2636,81 @@ export async function runGoogleAdsTransparency(
           );
 
         successfulAdvertisers += 1;
-        totalAdvertiserPages += expansion.pagesLoaded;
-        totalPreviewsFetched += expansion.previewsFetched;
-        totalPreviewDomainsResolved += expansion.previewDomainsResolved;
+        processedAdvertisers += 1;
+        nextOffset = absoluteIndex + 1;
+
+        totalAdvertiserPages +=
+          expansion.pagesLoaded;
+
+        totalPreviewsFetched +=
+          expansion.previewsFetched;
+
+        totalPreviewDomainsResolved +=
+          expansion.previewDomainsResolved;
 
         if (expansion.earlyStopped) {
           earlyStoppedAdvertisers += 1;
         }
 
         console.log(
-          `[SPY ADS V0.7.1.1] Advertiser done: ` +
+          `[SPY ADS V0.7.2] Advertiser done: ` +
           `${advertiser.advertiser_id} domains=${expansion.uniqueDomains}`
         );
       } catch (error) {
         const isRateLimited =
           error instanceof RateLimitedError;
 
-        if (
-          isRateLimited &&
-          item.retryPass < MAX_DEFERRED_RETRY_PASSES
-        ) {
-          deferredAdvertisers += 1;
-
-          workQueue.push({
-            advertiser,
-            retryPass: item.retryPass + 1,
-          });
+        if (isRateLimited) {
+          rateLimitedStop = true;
+          nextOffset = absoluteIndex;
 
           console.warn(
-            `[SPY ADS V0.7.1.1] DEFER advertiser=${advertiser.advertiser_id} retry_pass=${item.retryPass + 1}`
+            `[SPY ADS V0.7.2] RATE_LIMIT_STOP advertiser=${advertiser.advertiser_id} ` +
+            `next_offset=${nextOffset}`
           );
-        } else {
-          failedAdvertisers += 1;
 
-          console.error(
-            `[SPY ADS V0.7.1.1] Advertiser failed: ` +
-            `${advertiser.advertiser_id} ` +
-            `${isRateLimited ? "RATE_LIMITED" : "ERROR"}`
-          );
+          break;
         }
-      }
 
-      processedInChunk += 1;
+        failedAdvertisers += 1;
+        processedAdvertisers += 1;
+        nextOffset = absoluteIndex + 1;
 
-      if (
-        processedInChunk >= ADVERTISER_CHUNK_SIZE &&
-        workIndex < workQueue.length
-      ) {
-        const chunkWait =
-          jitterMs(
-            CHUNK_COOLDOWN_MS,
-            CHUNK_COOLDOWN_JITTER_MS
-          );
-
-        console.log(
-          `[SPY ADS V0.7.1.1] CHUNK_COOLDOWN after=${processedInChunk} advertisers wait=${Math.ceil(chunkWait / 1000)}s`
-        );
-
-        await sleep(chunkWait);
-        processedInChunk = 0;
-      } else {
-        await sleep(
-          jitterMs(
-            ADVERTISER_BATCH_DELAY_MS,
-            1500
-          )
+        console.error(
+          `[SPY ADS V0.7.2] Advertiser failed: ` +
+          `${advertiser.advertiser_id} ERROR`
         );
       }
+
+      await sleep(
+        jitterMs(
+          ADVERTISER_BATCH_DELAY_MS,
+          1500
+        )
+      );
     }
+
+    const hasMoreAdvertisers =
+      nextOffset <
+      allRankedAdvertisers.length;
+
+    const nextCursor =
+      hasMoreAdvertisers
+        ? makeSeedCursor(
+            seedDomain,
+            nextOffset
+          )
+        : undefined;
+
+    const retryAfterSeconds =
+      rateLimitController.cooldownUntil > Date.now()
+        ? Math.ceil(
+            (
+              rateLimitController.cooldownUntil -
+              Date.now()
+            ) / 1000
+          )
+        : 0;
 
     /* =====================================================
        STEP 2.5
@@ -2664,11 +2728,11 @@ export async function runGoogleAdsTransparency(
     const discoveredDomains =
       buildDomainSummaries(
         expansionCreatives,
-        seed
+        seedDomain
       );
 
     console.log(
-      "========== SPY ADS V0.7.1 RESULT =========="
+      "========== SPY ADS V0.7.2 RESULT =========="
     );
 
     console.log(
@@ -2679,11 +2743,6 @@ export async function runGoogleAdsTransparency(
     console.log(
       "SOURCE ADVERTISERS:",
       expandableAdvertisers.length
-    );
-
-    console.log(
-      "ADVERTISER BATCHES:",
-      batches.length
     );
 
     console.log(
@@ -2717,28 +2776,33 @@ export async function runGoogleAdsTransparency(
       Math.round((Date.now() - runStartedAt) / 1000);
 
     const finalStatus =
-      failedAdvertisers === 0 &&
-      rateLimitRetries === 0
-        ? "COMPLETED"
-        : failedAdvertisers < rankedAdvertisers.length
-          ? "COMPLETED_WITH_ERRORS"
-          : rateLimitRetries > 0
-            ? "RATE_LIMITED"
-            : "FAILED";
+      rateLimitedStop
+        ? "RATE_LIMITED_PARTIAL"
+        : hasMoreAdvertisers
+          ? "CHUNK_COMPLETED"
+          : failedAdvertisers === 0
+            ? "COMPLETED"
+            : "COMPLETED_WITH_ERRORS";
 
     console.log(
-      "========== SPY ADS V0.7.1 SUMMARY =========="
+      "========== SPY ADS V0.7.2 SUMMARY =========="
     );
     console.log("STATUS:", finalStatus);
-    console.log("SEED:", seed);
+    console.log("SEED:", seedDomain);
     console.log("SOURCE CREATIVES:", domainCreatives.length);
     console.log("SOURCE ADVERTISERS:", advertisers.length);
+    console.log("TOTAL RANKED ADVERTISERS:", allRankedAdvertisers.length);
     console.log("EXPANDABLE ADVERTISERS:", expandableAdvertisers.length);
     console.log("BRAND ADVERTISERS SKIPPED:", skippedBrandAdvertisers);
     console.log("ADVERTISERS REQUESTED:", rankedAdvertisers.length);
+    console.log("START OFFSET:", safeStartOffset);
+    console.log("NEXT OFFSET:", nextOffset);
+    console.log("PROCESSED THIS JOB:", processedAdvertisers);
+    console.log("HAS MORE ADVERTISERS:", hasMoreAdvertisers);
+    console.log("NEXT CURSOR:", nextCursor || "NONE");
+    console.log("RETRY AFTER SECONDS:", retryAfterSeconds);
     console.log("SUCCESSFUL ADVERTISERS:", successfulAdvertisers);
     console.log("FAILED ADVERTISERS:", failedAdvertisers);
-    console.log("DEFERRED ADVERTISERS:", deferredAdvertisers);
     console.log("EARLY STOPPED ADVERTISERS:", earlyStoppedAdvertisers);
     console.log("ADVERTISER PAGES:", totalAdvertiserPages);
     console.log("EXPANSION CREATIVES:", expansionCreatives.length);
@@ -2751,7 +2815,7 @@ export async function runGoogleAdsTransparency(
     console.log("DURATION SECONDS:", durationSeconds);
 
     console.log(
-      "========== END SPY ADS V0.7.1 =========="
+      "========== END SPY ADS V0.7.2 =========="
     );
 
     /*
@@ -2776,11 +2840,11 @@ export async function runGoogleAdsTransparency(
 
           source_url:
             `${BASE_URL}?domain=${encodeURIComponent(
-              seed
+              seedDomain
             )}`,
 
           source_ref:
-            seed,
+            seedDomain,
 
           observed_at:
             new Date()
@@ -2788,9 +2852,12 @@ export async function runGoogleAdsTransparency(
 
           raw_payload: {
             mode:
-              "SPY_ADS_EXPANSION_V071_RATE_LIMIT_CONTROLLED",
+              "SPY_ADS_V072_QUICK_CHUNK_CHECKPOINT",
 
             seed_domain:
+              seedDomain,
+
+            input_cursor:
               seed,
 
             requested_format:
@@ -2801,9 +2868,6 @@ export async function runGoogleAdsTransparency(
 
             expandable_advertisers:
               expandableAdvertisers.length,
-
-            advertiser_batches:
-              batches.length,
 
             advertiser_pages_loaded:
               totalAdvertiserPages,
@@ -2820,11 +2884,26 @@ export async function runGoogleAdsTransparency(
             final_status:
               finalStatus,
 
+            start_offset:
+              safeStartOffset,
+
+            next_offset:
+              nextOffset,
+
+            has_more_advertisers:
+              hasMoreAdvertisers,
+
+            next_cursor:
+              nextCursor,
+
+            retry_after_seconds:
+              retryAfterSeconds,
+
+            total_ranked_advertisers:
+              allRankedAdvertisers.length,
+
             successful_advertisers:
               successfulAdvertisers,
-
-            deferred_advertisers:
-              deferredAdvertisers,
 
             brand_advertisers_skipped:
               skippedBrandAdvertisers,
@@ -2879,15 +2958,16 @@ export async function runGoogleAdsTransparency(
         "completed",
 
       message:
-        `V0.7.1 ${finalStatus}. ` +
-        `${advertisers.length} advertiser(s) found from ${seed}; ` +
-        `${rankedAdvertisers.length} requested; ` +
+        `V0.7.2 ${finalStatus}. ` +
+        `${advertisers.length} advertiser(s) found from ${seedDomain}; ` +
+        `offset ${safeStartOffset}; ` +
+        `${processedAdvertisers} processed this job; ` +
         `${successfulAdvertisers} successful; ` +
         `${failedAdvertisers} failed; ` +
-        `${deferredAdvertisers} deferred; ` +
         `${discoveredDomains.length} new unique domain(s); ` +
-        `${rateLimitRetries} HTTP 429 retry/retries; ` +
-        `${rateLimitController.cooldownCount} global cooldown(s).`,
+        `${rateLimitRetries} HTTP 429 retry/retries. ` +
+        `${nextCursor ? `Next cursor: ${nextCursor}. ` : ""}` +
+        `${retryAfterSeconds > 0 ? `Retry after ~${retryAfterSeconds}s.` : ""}`,
 
       results,
     };
@@ -2895,7 +2975,7 @@ export async function runGoogleAdsTransparency(
     error
   ) {
     console.error(
-      "[SPY ADS V0.7.1 ERROR]",
+      "[SPY ADS V0.7.2 ERROR]",
       error
     );
 
@@ -2907,7 +2987,7 @@ export async function runGoogleAdsTransparency(
         error instanceof Error
           ? error.stack ||
             error.message
-          : "Unknown V0.7.1 error",
+          : "Unknown V0.7.2 error",
 
       results: [],
     };
