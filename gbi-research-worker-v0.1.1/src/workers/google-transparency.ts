@@ -893,124 +893,147 @@ function extractNextPageToken(
 ========================================================= */
 
 async function captureInitialSearch(
-  context:
-    BrowserContext,
-
-  seed:
-    string,
-
-  region:
-    string
+  context: BrowserContext,
+  seed: string,
+  region: string
 ): Promise<FirstSearchCapture> {
-  const page =
-    await context.newPage();
+  const page = await context.newPage();
 
-  const requestPromise =
-    page.waitForRequest(
-      request =>
-        request.method() ===
-          "POST" &&
-        request
-          .url()
-          .includes(
-            SEARCH_CREATIVES_PATH
-          ),
-      {
-        timeout:
-          45000,
-      }
-    );
+  const params = new URLSearchParams();
+  params.set("region", region);
+  params.set("domain", seed);
+  params.set("format", "TEXT");
 
-  const responsePromise =
-    page.waitForResponse(
-      response =>
-        response
-          .url()
-          .includes(
-            SEARCH_CREATIVES_PATH
-          ) &&
-        response.status() ===
-          200,
-      {
-        timeout:
-          45000,
-      }
-    );
-
-  const params =
-    new URLSearchParams();
-
-  params.set(
-    "region",
-    region
-  );
-
-  params.set(
-    "domain",
-    seed
-  );
-
-  /*
-   * TEXT only.
-   */
-  params.set(
-    "format",
-    "TEXT"
-  );
-
-  const url =
-    `${BASE_URL}?${params.toString()}`;
+  const url = `${BASE_URL}?${params.toString()}`;
 
   console.log(
-    "[SPY ADS V0.6.2] DOMAIN:",
+    "[SPY ADS V0.6.3] DOMAIN:",
     url
   );
 
-  await page.goto(
-    url,
-    {
-      waitUntil:
-        "domcontentloaded",
+  let capturedRequest: Request | undefined;
+  let capturedResponse: Response | undefined;
 
-      timeout:
-        45000,
+  /*
+   * Register listeners BEFORE navigation.
+   *
+   * Do not depend on waitForRequest/waitForResponse racing
+   * against Google's SPA initialization.
+   */
+  const onRequest = (request: Request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().includes(SEARCH_CREATIVES_PATH)
+    ) {
+      if (!capturedRequest) {
+        capturedRequest = request;
+
+        console.log(
+          "[SPY ADS V0.6.3] SearchCreatives REQUEST captured"
+        );
+      }
     }
-  );
+  };
 
-  const request =
-    await requestPromise;
+  const onResponse = (response: Response) => {
+    if (
+      response.url().includes(SEARCH_CREATIVES_PATH) &&
+      response.status() === 200
+    ) {
+      if (!capturedResponse) {
+        capturedResponse = response;
 
-  const response =
-    await responsePromise;
+        console.log(
+          "[SPY ADS V0.6.3] SearchCreatives RESPONSE captured"
+        );
+      }
+    }
+  };
 
-  const body =
-    await page
-      .locator(
-        "body"
-      )
+  page.on("request", onRequest);
+  page.on("response", onResponse);
+
+  try {
+    await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
+    });
+
+    /*
+     * Google Ads Transparency is an SPA.
+     * Give it time to initialize and fire SearchCreatives.
+     *
+     * Poll instead of using two independent 45s waits.
+     */
+    const startedAt = Date.now();
+    const timeoutMs = 60000;
+
+    while (
+      Date.now() - startedAt < timeoutMs &&
+      (!capturedRequest || !capturedResponse)
+    ) {
+      await sleep(250);
+    }
+
+    const body = await page
+      .locator("body")
       .innerText()
-      .catch(
-        () => ""
+      .catch(() => "");
+
+    const block = detectBlockState(body);
+
+    if (block.status) {
+      throw new Error(
+        block.message ||
+        "Google blocked request."
+      );
+    }
+
+    if (!capturedRequest) {
+      throw new Error(
+        `Initial SearchCreatives request was not captured for ${seed}.`
+      );
+    }
+
+    /*
+     * Normally request + response arrive together.
+     * If request exists but response was missed by listener,
+     * try to obtain its matching response directly.
+     */
+    if (!capturedResponse) {
+      console.warn(
+        `[SPY ADS V0.6.3] Request captured but response missing for ${seed}.`
       );
 
-  const block =
-    detectBlockState(
-      body
+      const response =
+        await capturedRequest.response().catch(() => null);
+
+      if (
+        response &&
+        response.status() === 200
+      ) {
+        capturedResponse = response;
+      }
+    }
+
+    if (!capturedResponse) {
+      throw new Error(
+        `Initial SearchCreatives response was not captured for ${seed}.`
+      );
+    }
+
+    console.log(
+      `[SPY ADS V0.6.3] INITIAL CAPTURE OK: ${seed}`
     );
 
-  if (
-    block.status
-  ) {
-    throw new Error(
-      block.message ||
-      "Google blocked request."
-    );
+    return {
+      request: capturedRequest,
+      response: capturedResponse,
+    };
+  } finally {
+    page.off("request", onRequest);
+    page.off("response", onResponse);
   }
-
-  return {
-    request,
-    response,
-  };
 }
 
 /* =========================================================
