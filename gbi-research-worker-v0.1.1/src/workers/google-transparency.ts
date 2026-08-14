@@ -12,6 +12,16 @@ import type {
 
 const BASE_URL = "https://adstransparency.google.com/";
 
+type AdvertiserType =
+  | "BRAND"
+  | "UNKNOWN"
+  | "DISCOVERY_ADVERTISER";
+
+type Confidence =
+  | "HIGH"
+  | "MEDIUM"
+  | "LOW";
+
 type AdvertiserRow = {
   advertiser_name: string;
   advertiser_id?: string;
@@ -21,18 +31,31 @@ type AdvertiserRow = {
   first_seen?: string;
   last_seen?: string;
 
-  advertiser_type:
-    | "BRAND"
-    | "UNKNOWN"
-    | "DISCOVERY_ADVERTISER";
-
+  advertiser_type: AdvertiserType;
   expand: boolean;
-
-  confidence:
-    | "HIGH"
-    | "MEDIUM"
-    | "LOW";
+  confidence: Confidence;
 };
+
+type DomCandidate = {
+  tag?: string;
+  text?: string;
+  href?: string;
+  ariaLabel?: string;
+  role?: string;
+  parentText?: string;
+};
+
+/* =========================================================
+   BASIC HELPERS
+========================================================= */
+
+function normalizeText(
+  value?: string | null
+): string {
+  return (value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function detectBlockState(
   text: string
@@ -40,112 +63,123 @@ function detectBlockState(
   status?: JobStatus;
   message?: string;
 } {
-  const v = text.toLowerCase();
+  const value =
+    text.toLowerCase();
 
   if (
-    v.includes("captcha") ||
-    v.includes("unusual traffic") ||
-    v.includes("verify you are human")
+    value.includes("captcha") ||
+    value.includes("unusual traffic") ||
+    value.includes("verify you are human")
   ) {
     return {
       status: "manual_required",
-      message: "Human verification/CAPTCHA detected.",
+      message:
+        "Human verification/CAPTCHA detected.",
     };
   }
 
   if (
-    v.includes("access denied") ||
-    v.includes("too many requests") ||
-    v.includes("rate limit")
+    value.includes("access denied") ||
+    value.includes("too many requests") ||
+    value.includes("rate limit")
   ) {
     return {
       status: "blocked",
-      message: "Google blocked or rate-limited this request.",
+      message:
+        "Google blocked or rate-limited this request.",
     };
   }
 
   return {};
 }
 
-/* -------------------------------------------------------
-   NORMALIZATION
-------------------------------------------------------- */
+/* =========================================================
+   BRAND NORMALIZATION
+========================================================= */
 
-function normalizeText(value?: string | null): string {
-  return (value || "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeBrandName(value: string): string {
+function normalizeBrandName(
+  value: string
+): string {
   return value
     .toLowerCase()
-
-    // remove legal company suffixes
     .replace(
-      /\b(llc|ltd|limited|inc|incorporated|corp|corporation|company|co)\b/g,
+      /\b(llc|ltd|limited|inc|incorporated|corp|corporation|company|co|plc|gmbh|pty)\b/g,
       ""
     )
-
-    .replace(/[^a-z0-9]/g, "")
+    .replace(
+      /[^a-z0-9]/g,
+      ""
+    )
     .trim();
 }
 
-function domainBrand(domain: string): string {
-  const host = domain
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "")
-    .split("/")[0];
+function domainBrand(
+  domain: string
+): string {
+  const hostname =
+    domain
+      .toLowerCase()
+      .replace(
+        /^https?:\/\//,
+        ""
+      )
+      .replace(
+        /^www\./,
+        ""
+      )
+      .split("/")[0];
+
+  const firstPart =
+    hostname.split(".")[0];
 
   return normalizeBrandName(
-    host.split(".")[0]
+    firstPart
   );
 }
 
-/* -------------------------------------------------------
-   BRAND CLASSIFIER
-------------------------------------------------------- */
+/* =========================================================
+   ADVERTISER CLASSIFICATION
+========================================================= */
 
 function classifyAdvertiser(
   advertiserName: string,
   seedDomain: string,
   adsCount: number
 ): {
-  type:
-    | "BRAND"
-    | "UNKNOWN"
-    | "DISCOVERY_ADVERTISER";
-
+  type: AdvertiserType;
   expand: boolean;
-
-  confidence:
-    | "HIGH"
-    | "MEDIUM"
-    | "LOW";
+  confidence: Confidence;
 } {
   const advertiser =
-    normalizeBrandName(advertiserName);
+    normalizeBrandName(
+      advertiserName
+    );
 
   const brand =
-    domainBrand(seedDomain);
+    domainBrand(
+      seedDomain
+    );
 
   /*
-   * Strong signal:
+   * Strong BRAND signal:
    *
    * COMFRT
    * COMFRT LLC
-   * COMFRT INC
+   * COMFRT CLOTHING LLC
    *
-   * vs comfrt.com
+   * for comfrt.com
    */
   if (
     advertiser &&
     brand &&
     (
       advertiser === brand ||
-      advertiser.includes(brand) ||
-      brand.includes(advertiser)
+      advertiser.includes(
+        brand
+      ) ||
+      brand.includes(
+        advertiser
+      )
     )
   ) {
     return {
@@ -156,15 +190,23 @@ function classifyAdvertiser(
   }
 
   /*
-   * Important:
+   * At DOMAIN_SEARCH stage we do NOT yet
+   * know how many distinct domains this
+   * advertiser runs.
    *
-   * We do NOT classify an advertiser as affiliate
-   * only because it has many ads.
+   * Therefore non-brand advertisers stay
+   * expandable.
    *
-   * Multi-domain classification will become stronger
-   * after ADVERTISER_SEARCH is implemented.
+   * ADVERTISER_SEARCH will later determine:
+   *
+   * 1 domain -> likely BRAND/direct
+   * 2-3 domains -> UNKNOWN
+   * 4+ domains -> DISCOVERY_ADVERTISER
+   * 10+ domains -> POWER DISCOVERY
    */
-  if (adsCount >= 20) {
+  if (
+    adsCount >= 20
+  ) {
     return {
       type: "UNKNOWN",
       expand: true,
@@ -179,9 +221,9 @@ function classifyAdvertiser(
   };
 }
 
-/* -------------------------------------------------------
+/* =========================================================
    DATE EXTRACTION
-------------------------------------------------------- */
+========================================================= */
 
 function extractDates(
   text: string
@@ -194,192 +236,338 @@ function extractDates(
     /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b/gi,
   ];
 
-  const found: string[] = [];
+  const found:
+    string[] = [];
 
-  for (const pattern of patterns) {
+  for (
+    const pattern
+    of patterns
+  ) {
     const matches =
-      text.match(pattern) || [];
+      text.match(
+        pattern
+      ) || [];
 
-    found.push(...matches);
+    found.push(
+      ...matches
+    );
   }
 
   return [
-    ...new Set(found),
+    ...new Set(
+      found
+    ),
   ];
 }
 
-/* -------------------------------------------------------
+/* =========================================================
    ADVERTISER ID EXTRACTION
-------------------------------------------------------- */
+========================================================= */
 
 function extractAdvertiserId(
   value: string
 ): string | undefined {
-  /*
-   * Google advertiser IDs commonly appear
-   * in URLs / advertiser links.
-   *
-   * We deliberately keep this permissive for
-   * diagnostics because Google's UI may change.
-   */
-
   const match =
     value.match(
       /\bAR[A-Z0-9_-]{5,}\b/i
     );
 
-  return match
-    ? match[0]
-    : undefined;
+  if (
+    !match
+  ) {
+    return undefined;
+  }
+
+  return match[0];
 }
 
-/* -------------------------------------------------------
-   LOAD MORE / SCROLL
-------------------------------------------------------- */
+/* =========================================================
+   LOAD DYNAMIC RESULTS
+========================================================= */
 
 async function expandResults(
   page: Page
 ): Promise<void> {
   /*
-   * Ads Transparency uses dynamic rendering.
+   * Google Transparency dynamically renders
+   * additional ad/result cards.
    *
-   * Scroll several times to allow additional
-   * result cards to render.
+   * Scroll progressively.
    */
+  for (
+    let i = 0;
+    i < 10;
+    i++
+  ) {
+    await page.evaluate(
+      () => {
+        window.scrollTo(
+          0,
+          document.body.scrollHeight
+        );
+      }
+    );
 
-  for (let i = 0; i < 8; i++) {
-    await page.evaluate(() => {
-      window.scrollTo(
-        0,
-        document.body.scrollHeight
-      );
-    });
-
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(
+      1200
+    );
   }
 
   /*
-   * Try common "load more" controls.
+   * Try visible "load more" style controls.
    */
-
-  const buttons = [
+  const possibleButtons = [
     page.getByRole(
       "button",
-      { name: /load more/i }
+      {
+        name: /load more/i,
+      }
     ),
 
     page.getByRole(
       "button",
-      { name: /show more/i }
+      {
+        name: /show more/i,
+      }
     ),
 
     page.getByText(
       /load more/i
     ),
+
+    page.getByText(
+      /show more/i
+    ),
   ];
 
-  for (const locator of buttons) {
+  for (
+    const locator
+    of possibleButtons
+  ) {
     try {
-      if (
-        await locator
-          .first()
-          .isVisible({
-            timeout: 800,
-          })
-      ) {
-        await locator
-          .first()
-          .click();
+      const button =
+        locator.first();
 
-        await page.waitForTimeout(2000);
+      if (
+        await button.isVisible({
+          timeout: 800,
+        })
+      ) {
+        await button.click();
+
+        await page.waitForTimeout(
+          2000
+        );
       }
     } catch {}
   }
 }
 
-/* -------------------------------------------------------
-   DOM DIAGNOSTICS
-------------------------------------------------------- */
+/* =========================================================
+   DOM COLLECTION
+========================================================= */
 
 async function collectPageCandidates(
   page: Page
-): Promise<any[]> {
+): Promise<DomCandidate[]> {
   return page
-    .evaluate(() => {
-      const selectors = [
-        "a[href]",
-        "[role='link']",
-        "[role='listitem']",
-        "article",
-      ];
+    .evaluate(
+      () => {
+        const selector = [
+          "a[href]",
+          "[role='link']",
+          "[role='listitem']",
+          "[role='row']",
+          "article",
+        ].join(",");
 
-      const nodes =
-        Array.from(
-          document.querySelectorAll(
-            selectors.join(",")
+        const nodes =
+          Array.from(
+            document.querySelectorAll(
+              selector
+            )
+          );
+
+        return nodes
+          .slice(
+            0,
+            1200
           )
-        );
+          .map(
+            (
+              node: any
+            ) => {
+              const anchor =
+                node.tagName === "A"
+                  ? node
+                  : node.querySelector?.(
+                      "a[href]"
+                    );
 
-      return nodes
-        .slice(0, 800)
-        .map((node: any) => {
-          const anchor =
-            node.tagName === "A"
-              ? node
-              : node.querySelector?.(
-                  "a[href]"
-                );
+              const parent =
+                node.parentElement;
 
-          return {
-            tag:
-              node.tagName,
+              return {
+                tag:
+                  node.tagName || "",
 
-            text:
-              (
-                node.innerText ||
-                node.textContent ||
-                ""
-              )
-                .replace(/\s+/g, " ")
-                .trim()
-                .slice(0, 2500),
+                text:
+                  (
+                    node.innerText ||
+                    node.textContent ||
+                    ""
+                  )
+                    .replace(
+                      /\s+/g,
+                      " "
+                    )
+                    .trim()
+                    .slice(
+                      0,
+                      2500
+                    ),
 
-            href:
-              anchor?.href || "",
+                href:
+                  anchor?.href || "",
 
-            ariaLabel:
-              node.getAttribute?.(
-                "aria-label"
-              ) || "",
+                ariaLabel:
+                  node.getAttribute?.(
+                    "aria-label"
+                  ) || "",
 
-            role:
-              node.getAttribute?.(
-                "role"
-              ) || "",
-          };
-        })
-        .filter(
-          (x: any) =>
-            x.text ||
-            x.href
-        );
-    })
-    .catch(() => []);
+                role:
+                  node.getAttribute?.(
+                    "role"
+                  ) || "",
+
+                parentText:
+                  (
+                    parent?.innerText ||
+                    parent?.textContent ||
+                    ""
+                  )
+                    .replace(
+                      /\s+/g,
+                      " "
+                    )
+                    .trim()
+                    .slice(
+                      0,
+                      2500
+                    ),
+              };
+            }
+          )
+          .filter(
+            (
+              item: any
+            ) =>
+              item.text ||
+              item.href ||
+              item.ariaLabel
+          );
+      }
+    )
+    .catch(
+      () => []
+    );
 }
 
-/* -------------------------------------------------------
+/* =========================================================
+   NAME EXTRACTION
+========================================================= */
+
+function cleanAdvertiserName(
+  text: string,
+  advertiserId?: string
+): string {
+  let value =
+    normalizeText(
+      text
+    );
+
+  if (
+    advertiserId
+  ) {
+    value =
+      value.replace(
+        new RegExp(
+          advertiserId,
+          "gi"
+        ),
+        ""
+      );
+  }
+
+  value =
+    value
+      .replace(
+        /advertiser details/gi,
+        ""
+      )
+      .replace(
+        /\badvertiser\b/gi,
+        ""
+      )
+      .replace(
+        /\babout this advertiser\b/gi,
+        ""
+      )
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim();
+
+  /*
+   * Avoid turning an entire giant card
+   * into advertiser name.
+   */
+  if (
+    value.length >
+    180
+  ) {
+    const parts =
+      value.split(
+        /[|•·]/g
+      );
+
+    value =
+      normalizeText(
+        parts[0]
+      );
+  }
+
+  /*
+   * Reject obvious bad names.
+   */
+  if (
+    value.length > 180
+  ) {
+    return "";
+  }
+
+  return value;
+}
+
+/* =========================================================
    PARSE ADVERTISERS
-------------------------------------------------------- */
+========================================================= */
 
 async function parseAdvertisers(
   page: Page,
   seedDomain: string
 ): Promise<{
-  advertisers: AdvertiserRow[];
-  diagnostics: any[];
+  advertisers:
+    AdvertiserRow[];
+
+  diagnostics:
+    DomCandidate[];
 }> {
   const candidates =
-    await collectPageCandidates(page);
+    await collectPageCandidates(
+      page
+    );
 
   type TempAdvertiser = {
     name: string;
@@ -392,20 +580,26 @@ async function parseAdvertisers(
     samples: string[];
   };
 
-  const advertiserMap =
+  const map =
     new Map<
       string,
       TempAdvertiser
     >();
 
-  /*
-   * Look for advertiser result links/cards.
-   */
-
-  for (const candidate of candidates) {
+  for (
+    const candidate
+    of candidates
+  ) {
     const combined =
       normalizeText(
-        `${candidate.text} ${candidate.href} ${candidate.ariaLabel}`
+        [
+          candidate.text,
+          candidate.href,
+          candidate.ariaLabel,
+          candidate.parentText,
+        ].join(
+          " "
+        )
       );
 
     const lower =
@@ -416,52 +610,59 @@ async function parseAdvertisers(
         combined
       );
 
-    const looksLikeAdvertiser =
-      advertiserId ||
+    /*
+     * Candidate must contain an advertiser
+     * indicator or advertiser ID.
+     */
+    const looksRelevant =
+      !!advertiserId ||
       lower.includes(
         "advertiser"
       );
 
-    if (!looksLikeAdvertiser) {
+    if (
+      !looksRelevant
+    ) {
       continue;
     }
 
     /*
-     * Try extracting advertiser name.
-     *
-     * Google often renders advertiser name
-     * near the advertiser link/card.
+     * Prefer visible text first.
      */
-
     let advertiserName =
-      normalizeText(
-        candidate.text
+      cleanAdvertiserName(
+        candidate.text || "",
+        advertiserId
       );
 
-    advertiserName =
-      advertiserName
-        .replace(
-          /advertiser details/gi,
-          ""
-        )
-        .replace(
-          /advertiser/gi,
-          ""
-        )
-        .trim();
-
     /*
-     * Avoid giant card text becoming
-     * advertiser name.
+     * If candidate itself has no usable name,
+     * try surrounding parent card text.
      */
-
     if (
-      advertiserName.length > 160
+      !advertiserName
     ) {
       advertiserName =
-        advertiserName
-          .split(/[|•·]/)[0]
-          .trim();
+        cleanAdvertiserName(
+          candidate.parentText ||
+            "",
+          advertiserId
+        );
+    }
+
+    /*
+     * If name is still empty,
+     * temporarily keep the ID.
+     *
+     * Diagnostics will let us map
+     * the exact DOM next.
+     */
+    if (
+      !advertiserName &&
+      advertiserId
+    ) {
+      advertiserName =
+        advertiserId;
     }
 
     if (
@@ -480,31 +681,50 @@ async function parseAdvertisers(
         combined
       );
 
-    const existing =
-      advertiserMap.get(key);
+    const current =
+      map.get(
+        key
+      );
 
-    if (existing) {
-      existing.count += 1;
+    if (
+      current
+    ) {
+      current.count += 1;
 
-      existing.dates.push(
+      current.dates.push(
         ...dates
       );
 
       if (
-        existing.samples.length < 3
+        current.samples.length <
+        5
       ) {
-        existing.samples.push(
+        current.samples.push(
           combined.slice(
             0,
-            800
+            1200
           )
         );
+      }
+
+      /*
+       * Upgrade name if previous value
+       * was just advertiser ID.
+       */
+      if (
+        current.name ===
+          current.id &&
+        advertiserName !==
+          advertiserId
+      ) {
+        current.name =
+          advertiserName;
       }
 
       continue;
     }
 
-    advertiserMap.set(
+    map.set(
       key,
       {
         name:
@@ -515,14 +735,15 @@ async function parseAdvertisers(
         id:
           advertiserId,
 
-        count: 1,
+        count:
+          1,
 
         dates,
 
         samples: [
           combined.slice(
             0,
-            800
+            1200
           ),
         ],
       }
@@ -530,11 +751,12 @@ async function parseAdvertisers(
   }
 
   const advertisers:
-    AdvertiserRow[] = [];
+    AdvertiserRow[] =
+    [];
 
   for (
     const item
-    of advertiserMap.values()
+    of map.values()
   ) {
     const uniqueDates =
       [
@@ -561,12 +783,15 @@ async function parseAdvertisers(
         item.count,
 
       first_seen:
-        uniqueDates[0],
+        uniqueDates.length
+          ? uniqueDates[0]
+          : undefined,
 
       last_seen:
         uniqueDates.length
           ? uniqueDates[
-              uniqueDates.length - 1
+              uniqueDates.length -
+                1
             ]
           : undefined,
 
@@ -582,36 +807,51 @@ async function parseAdvertisers(
   }
 
   advertisers.sort(
-    (a, b) =>
+    (
+      a,
+      b
+    ) =>
       b.text_ads_count -
       a.text_ads_count
   );
 
   /*
-   * Keep diagnostic candidates.
-   *
-   * If parsing isn't accurate yet,
-   * the next test tells us exactly
-   * what Google's DOM contains.
+   * Keep the most useful DOM samples.
    */
-
   const diagnostics =
     candidates
-      .filter((x) => {
-        const text =
-          `${x.text} ${x.href}`
-            .toLowerCase();
+      .filter(
+        (
+          item
+        ) => {
+          const value =
+            normalizeText(
+              [
+                item.text,
+                item.href,
+                item.ariaLabel,
+                item.parentText,
+              ].join(
+                " "
+              )
+            );
 
-        return (
-          text.includes(
-            "advertiser"
-          ) ||
-          /AR[A-Z0-9_-]{5,}/i.test(
-            text
-          )
-        );
-      })
-      .slice(0, 50);
+          return (
+            value
+              .toLowerCase()
+              .includes(
+                "advertiser"
+              ) ||
+            /AR[A-Z0-9_-]{5,}/i.test(
+              value
+            )
+          );
+        }
+      )
+      .slice(
+        0,
+        80
+      );
 
   return {
     advertisers,
@@ -619,9 +859,78 @@ async function parseAdvertisers(
   };
 }
 
-/* -------------------------------------------------------
-   MAIN DOMAIN SEARCH
-------------------------------------------------------- */
+/* =========================================================
+   DEBUG LOGGING
+========================================================= */
+
+function debugDomainSearch(
+  seed: string,
+  country: string | undefined,
+  sourceUrl: string,
+  advertisers: AdvertiserRow[],
+  diagnostics: DomCandidate[]
+): void {
+  console.log(
+    "========== SPY ADS DEBUG =========="
+  );
+
+  console.log(
+    "MODE: DOMAIN_SEARCH"
+  );
+
+  console.log(
+    "SEED DOMAIN:",
+    seed
+  );
+
+  console.log(
+    "COUNTRY:",
+    country ||
+      "anywhere"
+  );
+
+  console.log(
+    "FORMAT: TEXT"
+  );
+
+  console.log(
+    "SOURCE URL:",
+    sourceUrl
+  );
+
+  console.log(
+    "ADVERTISERS FOUND:",
+    advertisers.length
+  );
+
+  console.log(
+    "ADVERTISERS:",
+    JSON.stringify(
+      advertisers,
+      null,
+      2
+    )
+  );
+
+  console.log(
+    "DIAGNOSTICS:",
+    JSON.stringify(
+      diagnostics,
+      null,
+      2
+    )
+  );
+
+  console.log(
+    "========== END SPY ADS DEBUG =========="
+  );
+}
+
+/* =========================================================
+   MAIN
+   MODE 1:
+   DOMAIN -> ADVERTISERS
+========================================================= */
 
 export async function runGoogleAdsTransparency(
   seed: string,
@@ -648,7 +957,8 @@ export async function runGoogleAdsTransparency(
 
     context =
       await browser.newContext({
-        locale: "en-US",
+        locale:
+          "en-US",
 
         viewport: {
           width: 1440,
@@ -665,15 +975,10 @@ export async function runGoogleAdsTransparency(
       await context.newPage();
 
     /*
-     * IMPORTANT:
-     *
      * Direct DOMAIN query.
      *
-     * TEXT only.
-     *
-     * No need to interact with search box.
+     * TEXT ONLY.
      */
-
     const params =
       new URLSearchParams();
 
@@ -689,11 +994,17 @@ export async function runGoogleAdsTransparency(
 
     params.set(
       "region",
-      country || "anywhere"
+      country ||
+        "anywhere"
     );
 
     const url =
       `${BASE_URL}?${params.toString()}`;
+
+    console.log(
+      "[SPY ADS] Opening:",
+      url
+    );
 
     await page.goto(
       url,
@@ -707,49 +1018,70 @@ export async function runGoogleAdsTransparency(
     );
 
     /*
-     * Allow Angular / SPA to render.
+     * Allow Google SPA to render.
      */
-
     await page.waitForTimeout(
       5000
     );
 
     let body =
       await page
-        .locator("body")
+        .locator(
+          "body"
+        )
         .innerText()
         .catch(
           () => ""
         );
 
-    const block =
+    const initialBlock =
       detectBlockState(
         body
       );
 
-    if (block.status) {
+    if (
+      initialBlock.status
+    ) {
       return {
-        ...block,
+        ...initialBlock,
         results: [],
       };
     }
 
     /*
-     * Load more dynamic cards.
+     * Load more public cards.
      */
-
     await expandResults(
       page
     );
 
     body =
       await page
-        .locator("body")
+        .locator(
+          "body"
+        )
         .innerText()
         .catch(
           () => ""
         );
 
+    const afterLoadBlock =
+      detectBlockState(
+        body
+      );
+
+    if (
+      afterLoadBlock.status
+    ) {
+      return {
+        ...afterLoadBlock,
+        results: [],
+      };
+    }
+
+    /*
+     * Parse DOMAIN -> Advertisers.
+     */
     const parsed =
       await parseAdvertisers(
         page,
@@ -757,22 +1089,32 @@ export async function runGoogleAdsTransparency(
       );
 
     /*
-     * IMPORTANT:
+     * IMPORTANT DEBUG.
      *
-     * DiscoveryResult currently has
-     * a domain-oriented schema.
-     *
-     * For V0.2 we store advertiser
-     * data inside raw_payload.
-     *
-     * After Mode 1 works, we'll update
-     * the permanent database schema.
+     * This lets Railway Deploy Logs show
+     * exactly what Google rendered.
      */
+    debugDomainSearch(
+      seed,
+      country,
+      page.url(),
+      parsed.advertisers,
+      parsed.diagnostics
+    );
 
+    /*
+     * Current DiscoveryResult schema is
+     * domain-oriented.
+     *
+     * For now advertiser data stays in
+     * raw_payload until Mode 1 is verified.
+     */
     const results:
       DiscoveryResult[] =
       parsed.advertisers.map(
-        (advertiser) => ({
+        (
+          advertiser
+        ) => ({
           provider:
             "google_ads_transparency",
 
@@ -802,54 +1144,53 @@ export async function runGoogleAdsTransparency(
               "TEXT",
 
             advertiser_name:
-              advertiser.advertiser_name,
+              advertiser
+                .advertiser_name,
 
             advertiser_id:
-              advertiser.advertiser_id,
+              advertiser
+                .advertiser_id,
 
             text_ads_count:
-              advertiser.text_ads_count,
+              advertiser
+                .text_ads_count,
 
             first_seen:
-              advertiser.first_seen,
+              advertiser
+                .first_seen,
 
             last_seen:
-              advertiser.last_seen,
+              advertiser
+                .last_seen,
 
             advertiser_type:
-              advertiser.advertiser_type,
+              advertiser
+                .advertiser_type,
 
             expand:
-              advertiser.expand,
+              advertiser
+                .expand,
 
             confidence:
-              advertiser.confidence,
+              advertiser
+                .confidence,
           },
         })
       );
 
-    /*
-     * If no advertiser parsed,
-     * DO NOT pretend success.
-     *
-     * Return diagnostics so we can
-     * map Google's real DOM precisely.
-     */
-
     if (
-      results.length === 0
+      results.length ===
+      0
     ) {
       return {
         status:
           "manual_required",
 
         message:
-          "DOMAIN_SEARCH loaded successfully but advertiser parser found no advertiser records. " +
+          "DOMAIN_SEARCH loaded successfully but no advertiser records were parsed. " +
           `seed=${seed}; ` +
           `url=${page.url()}; ` +
-          `diagnostics=${JSON.stringify(
-            parsed.diagnostics
-          )}`,
+          "See Railway Deploy Logs between SPY ADS DEBUG markers.",
 
         results: [],
       };
@@ -865,30 +1206,45 @@ export async function runGoogleAdsTransparency(
 
       results,
     };
-  } catch (e) {
+  } catch (
+    error
+  ) {
+    console.error(
+      "[SPY ADS] DOMAIN_SEARCH ERROR:",
+      error
+    );
+
     return {
       status:
         "failed",
 
       message:
-        e instanceof Error
-          ? e.stack ||
-            e.message
+        error instanceof Error
+          ? error.stack ||
+            error.message
           : "Unknown browser error",
 
       results: [],
     };
   } finally {
-    if (context) {
+    if (
+      context
+    ) {
       await context
         .close()
-        .catch(() => {});
+        .catch(
+          () => {}
+        );
     }
 
-    if (browser) {
+    if (
+      browser
+    ) {
       await browser
         .close()
-        .catch(() => {});
+        .catch(
+          () => {}
+        );
     }
   }
 }
