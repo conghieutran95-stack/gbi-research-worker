@@ -28,12 +28,12 @@ const MAX_PAGES = 100;
  * Browser request observed 10 advertisers/batch.
  */
 const ADVERTISER_BATCH_SIZE = 1;
-const MAX_ADVERTISERS_TO_EXPAND = 1;
-const MAX_ADVERTISER_PAGES = 2;
+const MAX_ADVERTISERS_TO_EXPAND = 5;
+const MAX_ADVERTISER_PAGES = 3;
 const MAX_PREVIEWS_TO_FETCH = 30;
 const PREVIEW_FETCH_DELAY_MS = 450;
 
-// V0.6.2 rate-limit protection
+// V0.6.3 rate-limit protection
 const RPC_MAX_RETRIES = 6;
 const RPC_BASE_BACKOFF_MS = 2500;
 const RPC_MAX_BACKOFF_MS = 30000;
@@ -601,7 +601,7 @@ async function enrichTextCreativesFromPreviews(
       creative.domain = domain;
       resolved += 1;
       console.log(
-        `[SPY ADS V0.6.2] PREVIEW ${fetched}: ${creative.creative_id} -> ${domain}`
+        `[SPY ADS V0.6.3] PREVIEW ${fetched}: ${creative.creative_id} -> ${domain}`
       );
     }
 
@@ -609,7 +609,7 @@ async function enrichTextCreativesFromPreviews(
   }
 
   console.log(
-    `[SPY ADS V0.6.2] PREVIEWS FETCHED=${fetched}, DOMAINS RESOLVED=${resolved}`
+    `[SPY ADS V0.6.3] PREVIEWS FETCHED=${fetched}, DOMAINS RESOLVED=${resolved}`
   );
 
   return resolved;
@@ -914,12 +914,6 @@ async function captureInitialSearch(
   let capturedRequest: Request | undefined;
   let capturedResponse: Response | undefined;
 
-  /*
-   * Register listeners BEFORE navigation.
-   *
-   * Do not depend on waitForRequest/waitForResponse racing
-   * against Google's SPA initialization.
-   */
   const onRequest = (request: Request) => {
     if (
       request.method() === "POST" &&
@@ -927,7 +921,6 @@ async function captureInitialSearch(
     ) {
       if (!capturedRequest) {
         capturedRequest = request;
-
         console.log(
           "[SPY ADS V0.6.3] SearchCreatives REQUEST captured"
         );
@@ -942,7 +935,6 @@ async function captureInitialSearch(
     ) {
       if (!capturedResponse) {
         capturedResponse = response;
-
         console.log(
           "[SPY ADS V0.6.3] SearchCreatives RESPONSE captured"
         );
@@ -959,12 +951,6 @@ async function captureInitialSearch(
       timeout: 60000,
     });
 
-    /*
-     * Google Ads Transparency is an SPA.
-     * Give it time to initialize and fire SearchCreatives.
-     *
-     * Poll instead of using two independent 45s waits.
-     */
     const startedAt = Date.now();
     const timeoutMs = 60000;
 
@@ -995,11 +981,6 @@ async function captureInitialSearch(
       );
     }
 
-    /*
-     * Normally request + response arrive together.
-     * If request exists but response was missed by listener,
-     * try to obtain its matching response directly.
-     */
     if (!capturedResponse) {
       console.warn(
         `[SPY ADS V0.6.3] Request captured but response missing for ${seed}.`
@@ -1210,7 +1191,7 @@ async function requestRpcPage(
     const waitMs = retryDelayMs(attempt, retryAfter);
 
     console.warn(
-      `[SPY ADS V0.6.2] HTTP ${response.status()} - retry ` +
+      `[SPY ADS V0.6.3] HTTP ${response.status()} - retry ` +
       `${attempt + 1}/${RPC_MAX_RETRIES} after ${waitMs}ms`
     );
 
@@ -1296,7 +1277,7 @@ async function paginateRpc(
       before;
 
     console.log(
-      `[SPY ADS V0.6.2] ${label} PAGE ${pagesLoaded}: +${added}, total=${output.length}`
+      `[SPY ADS V0.6.3] ${label} PAGE ${pagesLoaded}: +${added}, total=${output.length}`
     );
 
     const nextToken =
@@ -1316,7 +1297,7 @@ async function paginateRpc(
       )
     ) {
       console.log(
-        `[SPY ADS V0.6.2] ${label}: repeated token, stop.`
+        `[SPY ADS V0.6.3] ${label}: repeated token, stop.`
       );
 
       break;
@@ -2134,7 +2115,7 @@ export async function runGoogleAdsTransparency(
       );
 
     console.log(
-      "========== V0.6.2 STEP 1 =========="
+      "========== V0.6.3 STEP 1 =========="
     );
 
     console.log(
@@ -2202,7 +2183,7 @@ export async function runGoogleAdsTransparency(
         batches[index];
 
       console.log(
-        `[SPY ADS V0.6.2] Advertiser batch ${
+        `[SPY ADS V0.6.3] Advertiser batch ${
           index + 1
         }/${batches.length}: ${batch.length} advertiser(s)`
       );
@@ -2257,7 +2238,7 @@ export async function runGoogleAdsTransparency(
       );
 
     console.log(
-      "========== SPY ADS V0.6.2 RESULT =========="
+      "========== SPY ADS V0.6.3 RESULT =========="
     );
 
     console.log(
@@ -2303,7 +2284,7 @@ export async function runGoogleAdsTransparency(
     );
 
     console.log(
-      "========== END SPY ADS V0.6.2 =========="
+      "========== END SPY ADS V0.6.3 =========="
     );
 
     /*
@@ -2340,7 +2321,7 @@ export async function runGoogleAdsTransparency(
 
           raw_payload: {
             mode:
-              "SPY_ADS_EXPANSION_V062_TEST",
+              "SPY_ADS_EXPANSION_V063_TEST",
 
             seed_domain:
               seed,
@@ -2398,7 +2379,7 @@ export async function runGoogleAdsTransparency(
         "completed",
 
       message:
-        `V0.6.2 completed. ` +
+        `V0.6.3 completed. ` +
         `${advertisers.length} advertiser(s) found from ${seed}; ` +
         `${advertiserIds.length} advertiser(s) tested; ` +
         `${expansionCreatives.length} expansion creative(s); ` +
@@ -2410,7 +2391,7 @@ export async function runGoogleAdsTransparency(
     error
   ) {
     console.error(
-      "[SPY ADS V0.6.2 ERROR]",
+      "[SPY ADS V0.6.3 ERROR]",
       error
     );
 
@@ -2422,7 +2403,7 @@ export async function runGoogleAdsTransparency(
         error instanceof Error
           ? error.stack ||
             error.message
-          : "Unknown V0.6 error",
+          : "Unknown V0.6.3 error",
 
       results: [],
     };
