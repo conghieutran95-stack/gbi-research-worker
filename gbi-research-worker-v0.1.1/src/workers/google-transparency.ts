@@ -27,7 +27,7 @@ const MAX_PAGES = 100;
  *
  * Browser request observed 10 advertisers/batch.
  */
-const ADVERTISER_BATCH_SIZE = 10;
+const ADVERTISER_BATCH_SIZE = 5;
 
 /* =========================================================
    TYPES
