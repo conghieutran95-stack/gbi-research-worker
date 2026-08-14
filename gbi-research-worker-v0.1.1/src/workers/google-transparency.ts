@@ -21,6 +21,14 @@ const SEARCH_CREATIVES_PATH =
 const PAGE_SIZE = 40;
 const MAX_PAGES = 100;
 
+/*
+ * Confirmed from real Google request:
+ * advertiser search accepts multiple AR IDs.
+ *
+ * Browser request observed 10 advertisers/batch.
+ */
+const ADVERTISER_BATCH_SIZE = 10;
+
 /* =========================================================
    TYPES
 ========================================================= */
@@ -28,7 +36,9 @@ const MAX_PAGES = 100;
 type CapturedCreative = {
   advertiser_id: string;
   advertiser_name: string;
+
   creative_id: string;
+
   domain: string;
 
   format_code?: number;
@@ -40,6 +50,7 @@ type CapturedCreative = {
 type AdvertiserSummary = {
   advertiser_id: string;
   advertiser_name: string;
+
   domain: string;
 
   creative_count: number;
@@ -58,13 +69,31 @@ type AdvertiserSummary = {
     | "MEDIUM";
 };
 
+type DomainSummary = {
+  domain: string;
+
+  creative_count: number;
+
+  advertiser_count: number;
+
+  advertiser_ids: string[];
+
+  advertisers: Array<{
+    advertiser_id: string;
+    advertiser_name: string;
+  }>;
+
+  first_seen?: string;
+  last_seen?: string;
+};
+
 type FirstSearchCapture = {
   request: Request;
   response: Response;
 };
 
 /* =========================================================
-   HELPERS
+   BASIC HELPERS
 ========================================================= */
 
 function normalizeText(
@@ -95,7 +124,10 @@ function normalizeBrandName(
       /\b(llc|ltd|limited|inc|incorporated|corp|corporation|company|co|plc|gmbh|pty)\b/g,
       ""
     )
-    .replace(/[^a-z0-9]/g, "")
+    .replace(
+      /[^a-z0-9]/g,
+      ""
+    )
     .trim();
 }
 
@@ -107,6 +139,31 @@ function domainBrand(
 
   return normalizeBrandName(
     hostname.split(".")[0] || ""
+  );
+}
+
+function isInfrastructureDomain(
+  domain: string
+): boolean {
+  const value =
+    normalizeDomain(domain);
+
+  const ignored = [
+    "google.com",
+    "googleusercontent.com",
+    "gstatic.com",
+    "googlesyndication.com",
+    "doubleclick.net",
+    "youtube.com",
+    "youtu.be",
+  ];
+
+  return ignored.some(
+    base =>
+      value === base ||
+      value.endsWith(
+        `.${base}`
+      )
   );
 }
 
@@ -134,8 +191,19 @@ function classifyAdvertiser(
     );
 
   const brand =
-    domainBrand(seedDomain);
+    domainBrand(
+      seedDomain
+    );
 
+  /*
+   * Example:
+   *
+   * comfrt.com
+   * Comfrt LLC
+   *
+   * => BRAND
+   * => do not expand
+   */
   if (
     advertiser &&
     brand &&
@@ -157,6 +225,12 @@ function classifyAdvertiser(
     };
   }
 
+  /*
+   * We do NOT label affiliate yet.
+   *
+   * Advertiser -> Domains is what gives
+   * us stronger evidence later.
+   */
   return {
     advertiser_type:
       "UNKNOWN",
@@ -224,7 +298,7 @@ function detectBlockState(
 }
 
 /* =========================================================
-   TIMESTAMP
+   GOOGLE TIMESTAMP
 ========================================================= */
 
 function googleTimestampToIso(
@@ -232,13 +306,16 @@ function googleTimestampToIso(
 ): string | undefined {
   if (
     !value ||
-    typeof value !== "object"
+    typeof value !==
+      "object"
   ) {
     return undefined;
   }
 
   const seconds =
-    Number(value["1"]);
+    Number(
+      value["1"]
+    );
 
   const nanos =
     Number(
@@ -246,7 +323,9 @@ function googleTimestampToIso(
     );
 
   if (
-    !Number.isFinite(seconds)
+    !Number.isFinite(
+      seconds
+    )
   ) {
     return undefined;
   }
@@ -254,11 +333,14 @@ function googleTimestampToIso(
   const milliseconds =
     seconds * 1000 +
     Math.floor(
-      nanos / 1_000_000
+      nanos /
+        1_000_000
     );
 
   const date =
-    new Date(milliseconds);
+    new Date(
+      milliseconds
+    );
 
   if (
     Number.isNaN(
@@ -282,10 +364,14 @@ function parseGoogleResponseText(
     text.trim();
 
   if (
-    value.startsWith(")]}'")
+    value.startsWith(
+      ")]}'"
+    )
   ) {
     const newline =
-      value.indexOf("\n");
+      value.indexOf(
+        "\n"
+      );
 
     if (
       newline >= 0
@@ -298,16 +384,23 @@ function parseGoogleResponseText(
   }
 
   try {
-    return JSON.parse(value);
+    return JSON.parse(
+      value
+    );
   } catch {}
 
   const objectStart =
-    value.indexOf("{");
+    value.indexOf(
+      "{"
+    );
 
   const arrayStart =
-    value.indexOf("[");
+    value.indexOf(
+      "["
+    );
 
-  let start = -1;
+  let start =
+    -1;
 
   if (
     objectStart >= 0 &&
@@ -334,7 +427,9 @@ function parseGoogleResponseText(
 
   try {
     return JSON.parse(
-      value.slice(start)
+      value.slice(
+        start
+      )
     );
   } catch {
     return undefined;
@@ -347,8 +442,12 @@ function parseGoogleResponseText(
 
 function extractCreativesRecursive(
   value: any,
-  output: CapturedCreative[],
-  seenCreativeIds: Set<string>
+
+  output:
+    CapturedCreative[],
+
+  seenCreativeIds:
+    Set<string>
 ): void {
   if (
     value === null ||
@@ -358,7 +457,9 @@ function extractCreativesRecursive(
   }
 
   if (
-    Array.isArray(value)
+    Array.isArray(
+      value
+    )
   ) {
     for (
       const child
@@ -409,11 +510,19 @@ function extractCreativesRecursive(
         )
       : undefined;
 
+  /*
+   * Strong signature observed in
+   * SearchCreatives response.
+   */
   if (
     advertiserId &&
-    advertiserId.startsWith("AR") &&
+    advertiserId.startsWith(
+      "AR"
+    ) &&
     creativeId &&
-    creativeId.startsWith("CR") &&
+    creativeId.startsWith(
+      "CR"
+    ) &&
     advertiserName &&
     domain
   ) {
@@ -459,7 +568,9 @@ function extractCreativesRecursive(
 
   for (
     const child
-    of Object.values(value)
+    of Object.values(
+      value
+    )
   ) {
     if (
       child !== null &&
@@ -477,11 +588,6 @@ function extractCreativesRecursive(
 
 /* =========================================================
    PAGINATION TOKEN
-
-   Confirmed from live SearchCreatives:
-
-   page 2 request:
-   f.req["4"] = pagination token
 ========================================================= */
 
 function extractNextPageToken(
@@ -496,10 +602,10 @@ function extractNextPageToken(
   }
 
   /*
-   * SearchCreatives response has the
-   * continuation token under field "2".
+   * Confirmed from DOMAIN mode.
    *
-   * Avoid AR/CR identifiers.
+   * Response field "2"
+   * -> request next page field "4".
    */
   const direct =
     data["2"];
@@ -507,24 +613,28 @@ function extractNextPageToken(
   if (
     typeof direct ===
       "string" &&
-    direct.length >= 20 &&
-    !direct.startsWith("AR") &&
-    !direct.startsWith("CR")
+    direct.length >=
+      20 &&
+    !direct.startsWith(
+      "AR"
+    ) &&
+    !direct.startsWith(
+      "CR"
+    )
   ) {
     return direct;
   }
 
-  /*
-   * Defensive fallback:
-   * find opaque token near shallow levels.
-   */
   const queue: Array<{
     value: any;
     depth: number;
   }> = [
     {
-      value: data,
-      depth: 0,
+      value:
+        data,
+
+      depth:
+        0,
     },
   ];
 
@@ -535,7 +645,8 @@ function extractNextPageToken(
       queue.shift()!;
 
     if (
-      current.depth > 3
+      current.depth >
+      3
     ) {
       continue;
     }
@@ -561,9 +672,14 @@ function extractNextPageToken(
         key === "2" &&
         typeof child ===
           "string" &&
-        child.length >= 30 &&
-        !child.startsWith("AR") &&
-        !child.startsWith("CR")
+        child.length >=
+          30 &&
+        !child.startsWith(
+          "AR"
+        ) &&
+        !child.startsWith(
+          "CR"
+        )
       ) {
         return child;
       }
@@ -574,9 +690,12 @@ function extractNextPageToken(
           "object"
       ) {
         queue.push({
-          value: child,
+          value:
+            child,
+
           depth:
-            current.depth + 1,
+            current.depth +
+            1,
         });
       }
     }
@@ -586,13 +705,18 @@ function extractNextPageToken(
 }
 
 /* =========================================================
-   INITIAL REQUEST CAPTURE
+   INITIAL DOMAIN REQUEST
 ========================================================= */
 
 async function captureInitialSearch(
-  context: BrowserContext,
-  seed: string,
-  region: string
+  context:
+    BrowserContext,
+
+  seed:
+    string,
+
+  region:
+    string
 ): Promise<FirstSearchCapture> {
   const page =
     await context.newPage();
@@ -643,7 +767,7 @@ async function captureInitialSearch(
   );
 
   /*
-   * Keep user's required format.
+   * TEXT only.
    */
   params.set(
     "format",
@@ -654,7 +778,7 @@ async function captureInitialSearch(
     `${BASE_URL}?${params.toString()}`;
 
   console.log(
-    "[SPY ADS V0.5] Opening:",
+    "[SPY ADS V0.6] DOMAIN:",
     url
   );
 
@@ -677,7 +801,9 @@ async function captureInitialSearch(
 
   const body =
     await page
-      .locator("body")
+      .locator(
+        "body"
+      )
       .innerText()
       .catch(
         () => ""
@@ -704,11 +830,12 @@ async function captureInitialSearch(
 }
 
 /* =========================================================
-   INITIAL f.req
+   PARSE INITIAL f.req
 ========================================================= */
 
 function parseInitialPayload(
-  request: Request
+  request:
+    Request
 ): Record<string, any> {
   const postData =
     request.postData();
@@ -727,7 +854,9 @@ function parseInitialPayload(
     );
 
   const raw =
-    form.get("f.req");
+    form.get(
+      "f.req"
+    );
 
   if (
     !raw
@@ -756,22 +885,23 @@ function parseInitialPayload(
 
 /* =========================================================
    REPLAY HEADERS
-
-   DO NOT hardcode:
-   - cookies
-   - SID
-   - SAPISID
-   - XSRF
-
-   We copy current browser request headers.
 ========================================================= */
 
 async function buildReplayHeaders(
-  request: Request
-): Promise<Record<string, string>> {
+  request:
+    Request
+): Promise<
+  Record<string, string>
+> {
   const original =
-    await request.allHeaders();
+    await request
+      .allHeaders();
 
+  /*
+   * Do NOT hard-code Google cookies/session.
+   *
+   * BrowserContext handles cookies.
+   */
   const allowed = [
     "accept",
     "accept-language",
@@ -783,8 +913,10 @@ async function buildReplayHeaders(
   ];
 
   const headers:
-    Record<string, string> =
-    {};
+    Record<
+      string,
+      string
+    > = {};
 
   for (
     const key
@@ -810,19 +942,39 @@ async function buildReplayHeaders(
 }
 
 /* =========================================================
-   DIRECT RPC PAGE REQUEST
+   GENERIC RPC REQUEST
 ========================================================= */
 
-async function requestPage(
-  context: BrowserContext,
-  endpoint: string,
-  headers: Record<string, string>,
-  basePayload: Record<string, any>,
-  token?: string
+async function requestRpcPage(
+  context:
+    BrowserContext,
+
+  endpoint:
+    string,
+
+  headers:
+    Record<
+      string,
+      string
+    >,
+
+  basePayload:
+    Record<
+      string,
+      any
+    >,
+
+  token?:
+    string
 ): Promise<{
-  response: APIResponse;
-  data: any;
-  text: string;
+  response:
+    APIResponse;
+
+  data:
+    any;
+
+  text:
+    string;
 }> {
   const payload =
     JSON.parse(
@@ -832,7 +984,10 @@ async function requestPage(
     );
 
   /*
-   * Confirmed from user's PAGE 2 cURL.
+   * Confirmed pagination:
+   *
+   * request field "4"
+   * = previous response token.
    */
   if (
     token
@@ -867,7 +1022,8 @@ async function requestPage(
       );
 
   const text =
-    await response.text();
+    await response
+      .text();
 
   if (
     !response.ok()
@@ -901,13 +1057,249 @@ async function requestPage(
 }
 
 /* =========================================================
-   GROUP ADVERTISERS
+   PAGINATE AN RPC PAYLOAD
+========================================================= */
+
+async function paginateRpc(
+  context:
+    BrowserContext,
+
+  endpoint:
+    string,
+
+  headers:
+    Record<
+      string,
+      string
+    >,
+
+  payload:
+    Record<
+      string,
+      any
+    >,
+
+  output:
+    CapturedCreative[],
+
+  seenCreativeIds:
+    Set<string>,
+
+  label:
+    string
+): Promise<number> {
+  const seenTokens =
+    new Set<string>();
+
+  let pagesLoaded =
+    0;
+
+  let token:
+    string | undefined;
+
+  while (
+    pagesLoaded <
+    MAX_PAGES
+  ) {
+    const before =
+      output.length;
+
+    const page =
+      await requestRpcPage(
+        context,
+        endpoint,
+        headers,
+        payload,
+        token
+      );
+
+    extractCreativesRecursive(
+      page.data,
+      output,
+      seenCreativeIds
+    );
+
+    pagesLoaded +=
+      1;
+
+    const added =
+      output.length -
+      before;
+
+    console.log(
+      `[SPY ADS V0.6] ${label} PAGE ${pagesLoaded}: +${added}, total=${output.length}`
+    );
+
+    const nextToken =
+      extractNextPageToken(
+        page.data
+      );
+
+    if (
+      !nextToken
+    ) {
+      break;
+    }
+
+    if (
+      seenTokens.has(
+        nextToken
+      )
+    ) {
+      console.log(
+        `[SPY ADS V0.6] ${label}: repeated token, stop.`
+      );
+
+      break;
+    }
+
+    seenTokens.add(
+      nextToken
+    );
+
+    token =
+      nextToken;
+
+    /*
+     * Avoid hammering provider.
+     */
+    await new Promise(
+      resolve =>
+        setTimeout(
+          resolve,
+          550
+        )
+    );
+  }
+
+  return pagesLoaded;
+}
+
+/* =========================================================
+   DOMAIN MODE PAYLOAD
+========================================================= */
+
+function buildDomainPayload(
+  initialPayload:
+    Record<
+      string,
+      any
+    >
+): Record<
+  string,
+  any
+> {
+  const payload =
+    JSON.parse(
+      JSON.stringify(
+        initialPayload
+      )
+    );
+
+  delete payload["4"];
+
+  return payload;
+}
+
+/* =========================================================
+   ADVERTISER MODE PAYLOAD
+
+   Confirmed from user's real browser request:
+
+   "3": {
+      "12": {
+         "1": "",
+         "2": true
+      },
+      "13": {
+         "1": [
+            "AR...",
+            "AR..."
+         ]
+      }
+   }
+========================================================= */
+
+function buildAdvertiserPayload(
+  initialPayload:
+    Record<
+      string,
+      any
+    >,
+
+  advertiserIds:
+    string[]
+): Record<
+  string,
+  any
+> {
+  const payload =
+    JSON.parse(
+      JSON.stringify(
+        initialPayload
+      )
+    );
+
+  payload["2"] =
+    PAGE_SIZE;
+
+  payload["3"] = {
+    "12": {
+      "1": "",
+      "2": true,
+    },
+
+    "13": {
+      "1":
+        advertiserIds,
+    },
+  };
+
+  delete payload["4"];
+
+  return payload;
+}
+
+/* =========================================================
+   BATCH
+========================================================= */
+
+function chunkArray<T>(
+  items:
+    T[],
+
+  size:
+    number
+): T[][] {
+  const result:
+    T[][] = [];
+
+  for (
+    let i = 0;
+    i < items.length;
+    i += size
+  ) {
+    result.push(
+      items.slice(
+        i,
+        i + size
+      )
+    );
+  }
+
+  return result;
+}
+
+/* =========================================================
+   DOMAIN -> ADVERTISER SUMMARY
 ========================================================= */
 
 function buildAdvertiserSummaries(
   creatives:
     CapturedCreative[],
-  seedDomain: string
+
+  seedDomain:
+    string
 ): AdvertiserSummary[] {
   type Temp = {
     advertiser_id:
@@ -952,7 +1344,8 @@ function buildAdvertiserSummaries(
 
     const current =
       map.get(
-        creative.advertiser_id
+        creative
+          .advertiser_id
       );
 
     if (
@@ -961,23 +1354,32 @@ function buildAdvertiserSummaries(
       current
         .creativeIds
         .add(
-          creative.creative_id
+          creative
+            .creative_id
         );
 
       if (
-        creative.first_seen
+        creative
+          .first_seen
       ) {
-        current.dates.push(
-          creative.first_seen
-        );
+        current
+          .dates
+          .push(
+            creative
+              .first_seen
+          );
       }
 
       if (
-        creative.last_seen
+        creative
+          .last_seen
       ) {
-        current.dates.push(
-          creative.last_seen
-        );
+        current
+          .dates
+          .push(
+            creative
+              .last_seen
+          );
       }
 
       continue;
@@ -987,36 +1389,44 @@ function buildAdvertiserSummaries(
       string[] = [];
 
     if (
-      creative.first_seen
+      creative
+        .first_seen
     ) {
       dates.push(
-        creative.first_seen
+        creative
+          .first_seen
       );
     }
 
     if (
-      creative.last_seen
+      creative
+        .last_seen
     ) {
       dates.push(
-        creative.last_seen
+        creative
+          .last_seen
       );
     }
 
     map.set(
-      creative.advertiser_id,
+      creative
+        .advertiser_id,
       {
         advertiser_id:
-          creative.advertiser_id,
+          creative
+            .advertiser_id,
 
         advertiser_name:
-          creative.advertiser_name,
+          creative
+            .advertiser_name,
 
         domain:
           creative.domain,
 
         creativeIds:
           new Set([
-            creative.creative_id,
+            creative
+              .creative_id,
           ]),
 
         dates,
@@ -1076,10 +1486,12 @@ function buildAdvertiserSummaries(
           .advertiser_type,
 
       expand:
-        classification.expand,
+        classification
+          .expand,
 
       confidence:
-        classification.confidence,
+        classification
+          .confidence,
     });
   }
 
@@ -1094,15 +1506,281 @@ function buildAdvertiserSummaries(
 }
 
 /* =========================================================
-   MAIN V0.5
+   ADVERTISER -> DOMAIN SUMMARY
+========================================================= */
+
+function buildDomainSummaries(
+  creatives:
+    CapturedCreative[],
+
+  seedDomain:
+    string
+): DomainSummary[] {
+  type Temp = {
+    domain:
+      string;
+
+    creativeIds:
+      Set<string>;
+
+    advertisers:
+      Map<
+        string,
+        string
+      >;
+
+    dates:
+      string[];
+  };
+
+  const seed =
+    normalizeDomain(
+      seedDomain
+    );
+
+  const map =
+    new Map<
+      string,
+      Temp
+    >();
+
+  for (
+    const creative
+    of creatives
+  ) {
+    const domain =
+      normalizeDomain(
+        creative.domain
+      );
+
+    if (
+      !domain ||
+      domain === seed ||
+      isInfrastructureDomain(
+        domain
+      )
+    ) {
+      continue;
+    }
+
+    const current =
+      map.get(
+        domain
+      );
+
+    if (
+      current
+    ) {
+      current
+        .creativeIds
+        .add(
+          creative
+            .creative_id
+        );
+
+      current
+        .advertisers
+        .set(
+          creative
+            .advertiser_id,
+
+          creative
+            .advertiser_name
+        );
+
+      if (
+        creative
+          .first_seen
+      ) {
+        current
+          .dates
+          .push(
+            creative
+              .first_seen
+          );
+      }
+
+      if (
+        creative
+          .last_seen
+      ) {
+        current
+          .dates
+          .push(
+            creative
+              .last_seen
+          );
+      }
+
+      continue;
+    }
+
+    const advertisers =
+      new Map<
+        string,
+        string
+      >();
+
+    advertisers.set(
+      creative
+        .advertiser_id,
+
+      creative
+        .advertiser_name
+    );
+
+    const dates:
+      string[] = [];
+
+    if (
+      creative
+        .first_seen
+    ) {
+      dates.push(
+        creative
+          .first_seen
+      );
+    }
+
+    if (
+      creative
+        .last_seen
+    ) {
+      dates.push(
+        creative
+          .last_seen
+      );
+    }
+
+    map.set(
+      domain,
+      {
+        domain,
+
+        creativeIds:
+          new Set([
+            creative
+              .creative_id,
+          ]),
+
+        advertisers,
+
+        dates,
+      }
+    );
+  }
+
+  const result:
+    DomainSummary[] =
+    [];
+
+  for (
+    const item
+    of map.values()
+  ) {
+    const dates =
+      [
+        ...new Set(
+          item.dates
+        ),
+      ].sort();
+
+    const advertisers =
+      Array.from(
+        item
+          .advertisers
+          .entries()
+      )
+        .map(
+          ([
+            advertiser_id,
+            advertiser_name,
+          ]) => ({
+            advertiser_id,
+            advertiser_name,
+          })
+        );
+
+    result.push({
+      domain:
+        item.domain,
+
+      creative_count:
+        item
+          .creativeIds
+          .size,
+
+      advertiser_count:
+        advertisers.length,
+
+      advertiser_ids:
+        advertisers.map(
+          advertiser =>
+            advertiser
+              .advertiser_id
+        ),
+
+      advertisers,
+
+      first_seen:
+        dates[0],
+
+      last_seen:
+        dates.length
+          ? dates[
+              dates.length -
+                1
+            ]
+          : undefined,
+    });
+  }
+
+  /*
+   * Strong discovery domains first.
+   *
+   * More advertisers +
+   * more creatives first.
+   */
+  return result.sort(
+    (
+      a,
+      b
+    ) => {
+      if (
+        b.advertiser_count !==
+        a.advertiser_count
+      ) {
+        return (
+          b.advertiser_count -
+          a.advertiser_count
+        );
+      }
+
+      return (
+        b.creative_count -
+        a.creative_count
+      );
+    }
+  );
+}
+
+/* =========================================================
+   MAIN V0.6
 ========================================================= */
 
 export async function runGoogleAdsTransparency(
-  seed: string,
-  country?: string
+  seed:
+    string,
+
+  country?:
+    string
 ): Promise<{
-  status: JobStatus;
-  message?: string;
+  status:
+    JobStatus;
+
+  message?:
+    string;
+
   results:
     DiscoveryResult[];
 }> {
@@ -1111,16 +1789,6 @@ export async function runGoogleAdsTransparency(
 
   let context:
     BrowserContext | undefined;
-
-  const creatives:
-    CapturedCreative[] =
-    [];
-
-  const seenCreativeIds =
-    new Set<string>();
-
-  const seenTokens =
-    new Set<string>();
 
   const region =
     country ||
@@ -1154,10 +1822,11 @@ export async function runGoogleAdsTransparency(
           "Chrome/131.0.0.0 Safari/537.36",
       });
 
-    /*
-     * Let Google's own frontend create:
-     * cookies + XSRF + request payload.
-     */
+    /* =====================================================
+       STEP 1
+       DOMAIN -> ADVERTISERS
+    ===================================================== */
+
     const initial =
       await captureInitialSearch(
         context,
@@ -1166,9 +1835,11 @@ export async function runGoogleAdsTransparency(
       );
 
     const endpoint =
-      initial.request.url();
+      initial
+        .request
+        .url();
 
-    const payload =
+    const initialPayload =
       parseInitialPayload(
         initial.request
       );
@@ -1178,11 +1849,20 @@ export async function runGoogleAdsTransparency(
         initial.request
       );
 
+    const domainCreatives:
+      CapturedCreative[] =
+      [];
+
+    const domainSeenIds =
+      new Set<string>();
+
     /*
-     * PAGE 1
+     * PAGE 1 came from browser.
      */
     const page1Text =
-      await initial.response.text();
+      await initial
+        .response
+        .text();
 
     const page1Data =
       parseGoogleResponseText(
@@ -1193,106 +1873,72 @@ export async function runGoogleAdsTransparency(
       !page1Data
     ) {
       throw new Error(
-        "Unable to parse PAGE 1."
+        "Unable to parse DOMAIN PAGE 1."
       );
     }
 
     extractCreativesRecursive(
       page1Data,
-      creatives,
-      seenCreativeIds
+      domainCreatives,
+      domainSeenIds
     );
+
+    let domainPages =
+      1;
 
     let token =
       extractNextPageToken(
         page1Data
       );
 
-    console.log(
-      "[SPY ADS V0.5] PAGE 1:",
-      creatives.length,
-      "unique creatives"
-    );
-
-    /*
-     * PAGE 2 -> N
-     */
-    let pagesLoaded =
-      1;
+    const seenDomainTokens =
+      new Set<string>();
 
     while (
       token &&
-      pagesLoaded <
+      domainPages <
         MAX_PAGES
     ) {
       if (
-        seenTokens.has(
+        seenDomainTokens.has(
           token
         )
       ) {
-        console.log(
-          "[SPY ADS V0.5] Repeated pagination token. Stop."
-        );
-
         break;
       }
 
-      seenTokens.add(
+      seenDomainTokens.add(
         token
       );
 
-      const before =
-        creatives.length;
+      const domainPayload =
+        buildDomainPayload(
+          initialPayload
+        );
 
       const next =
-        await requestPage(
+        await requestRpcPage(
           context,
           endpoint,
           replayHeaders,
-          payload,
+          domainPayload,
           token
         );
 
       extractCreativesRecursive(
         next.data,
-        creatives,
-        seenCreativeIds
+        domainCreatives,
+        domainSeenIds
       );
 
-      pagesLoaded += 1;
+      domainPages +=
+        1;
 
-      const added =
-        creatives.length -
-        before;
-
-      console.log(
-        `[SPY ADS V0.5] PAGE ${pagesLoaded}: +${added}, total=${creatives.length}`
-      );
-
-      const nextToken =
+      token =
         extractNextPageToken(
           next.data
         );
 
-      /*
-       * No continuation token means finished.
-       */
-      if (
-        !nextToken
-      ) {
-        console.log(
-          "[SPY ADS V0.5] No next token. Finished."
-        );
-
-        break;
-      }
-
-      token =
-        nextToken;
-
-      /*
-       * Avoid hammering Google.
-       */
       await new Promise(
         resolve =>
           setTimeout(
@@ -1304,55 +1950,209 @@ export async function runGoogleAdsTransparency(
 
     const advertisers =
       buildAdvertiserSummaries(
-        creatives,
+        domainCreatives,
         seed
       );
 
+    /*
+     * Critical business rule:
+     *
+     * BRAND advertiser is NOT expanded.
+     *
+     * Only other advertisers become
+     * discovery bridges.
+     */
+    const expandableAdvertisers =
+      advertisers.filter(
+        advertiser =>
+          advertiser.expand &&
+          advertiser
+            .advertiser_type !==
+            "BRAND"
+      );
+
     console.log(
-      "========== SPY ADS V0.5 =========="
+      "========== V0.6 STEP 1 =========="
     );
 
     console.log(
-      "DOMAIN:",
+      "SEED DOMAIN:",
       seed
     );
 
     console.log(
-      "PAGES LOADED:",
-      pagesLoaded
+      "DOMAIN PAGES:",
+      domainPages
     );
 
     console.log(
-      "UNIQUE CREATIVES:",
-      creatives.length
+      "DOMAIN CREATIVES:",
+      domainCreatives.length
     );
 
     console.log(
-      "ADVERTISERS:",
+      "ADVERTISERS FOUND:",
       advertisers.length
     );
 
     console.log(
+      "EXPANDABLE ADVERTISERS:",
+      expandableAdvertisers.length
+    );
+
+    /* =====================================================
+       STEP 2
+       ADVERTISERS -> DOMAINS
+    ===================================================== */
+
+    const advertiserIds =
+      expandableAdvertisers
+        .map(
+          advertiser =>
+            advertiser
+              .advertiser_id
+        );
+
+    const batches =
+      chunkArray(
+        advertiserIds,
+        ADVERTISER_BATCH_SIZE
+      );
+
+    const expansionCreatives:
+      CapturedCreative[] =
+      [];
+
+    const expansionSeenIds =
+      new Set<string>();
+
+    let advertiserPages =
+      0;
+
+    for (
+      let index = 0;
+      index <
+      batches.length;
+      index++
+    ) {
+      const batch =
+        batches[index];
+
+      console.log(
+        `[SPY ADS V0.6] Advertiser batch ${
+          index + 1
+        }/${batches.length}: ${batch.length} advertiser(s)`
+      );
+
+      const payload =
+        buildAdvertiserPayload(
+          initialPayload,
+          batch
+        );
+
+      const loaded =
+        await paginateRpc(
+          context,
+          endpoint,
+          replayHeaders,
+          payload,
+          expansionCreatives,
+          expansionSeenIds,
+          `ADV-BATCH-${index + 1}`
+        );
+
+      advertiserPages +=
+        loaded;
+
+      /*
+       * Be conservative between batches.
+       */
+      await new Promise(
+        resolve =>
+          setTimeout(
+            resolve,
+            1000
+          )
+      );
+    }
+
+    /* =====================================================
+       STEP 3
+       CREATIVE -> UNIQUE DOMAINS
+    ===================================================== */
+
+    const discoveredDomains =
+      buildDomainSummaries(
+        expansionCreatives,
+        seed
+      );
+
+    console.log(
+      "========== SPY ADS V0.6 RESULT =========="
+    );
+
+    console.log(
+      "SEED:",
+      seed
+    );
+
+    console.log(
+      "SOURCE ADVERTISERS:",
+      expandableAdvertisers.length
+    );
+
+    console.log(
+      "ADVERTISER BATCHES:",
+      batches.length
+    );
+
+    console.log(
+      "ADVERTISER PAGES:",
+      advertiserPages
+    );
+
+    console.log(
+      "EXPANSION CREATIVES:",
+      expansionCreatives.length
+    );
+
+    console.log(
+      "NEW UNIQUE DOMAINS:",
+      discoveredDomains.length
+    );
+
+    console.log(
+      "TOP DOMAINS:",
       JSON.stringify(
-        advertisers,
+        discoveredDomains.slice(
+          0,
+          30
+        ),
         null,
         2
       )
     );
 
     console.log(
-      "========== END V0.5 =========="
+      "========== END SPY ADS V0.6 =========="
     );
 
+    /*
+     * FINAL OUTPUT:
+     *
+     * One DiscoveryResult per DOMAIN.
+     *
+     * Domain is the final asset we care about.
+     */
     const results:
       DiscoveryResult[] =
-      advertisers.map(
-        advertiser => ({
+      discoveredDomains.map(
+        domain => ({
           provider:
             "google_ads_transparency",
 
           domain:
-            seed,
+            domain.domain,
 
           country:
             region,
@@ -1371,7 +2171,7 @@ export async function runGoogleAdsTransparency(
 
           raw_payload: {
             mode:
-              "DOMAIN_SEARCH_RPC_V05",
+              "SPY_ADS_EXPANSION_V06",
 
             seed_domain:
               seed,
@@ -1379,71 +2179,58 @@ export async function runGoogleAdsTransparency(
             requested_format:
               "TEXT",
 
-            pages_loaded:
-              pagesLoaded,
+            source_advertisers_found:
+              advertisers.length,
 
-            total_unique_creatives:
-              creatives.length,
+            expandable_advertisers:
+              expandableAdvertisers.length,
 
-            advertiser_id:
-              advertiser
-                .advertiser_id,
+            advertiser_batches:
+              batches.length,
 
-            advertiser_name:
-              advertiser
-                .advertiser_name,
+            advertiser_pages_loaded:
+              advertiserPages,
+
+            expansion_creatives_total:
+              expansionCreatives.length,
+
+            discovered_domain:
+              domain.domain,
 
             creative_count:
-              advertiser
-                .creative_count,
+              domain.creative_count,
+
+            advertiser_count:
+              domain.advertiser_count,
+
+            advertiser_ids:
+              domain.advertiser_ids,
+
+            advertisers:
+              domain.advertisers,
 
             first_seen:
-              advertiser
-                .first_seen,
+              domain.first_seen,
 
             last_seen:
-              advertiser
-                .last_seen,
+              domain.last_seen,
 
-            advertiser_type:
-              advertiser
-                .advertiser_type,
-
-            expand:
-              advertiser
-                .expand,
-
-            confidence:
-              advertiser
-                .confidence,
+            discovered_via:
+              "ADVERTISER_EXPANSION",
           },
         })
       );
-
-    if (
-      creatives.length ===
-      0
-    ) {
-      return {
-        status:
-          "manual_required",
-
-        message:
-          "SearchCreatives returned no creative records.",
-
-        results: [],
-      };
-    }
 
     return {
       status:
         "completed",
 
       message:
-        `V0.5 completed. ` +
-        `${pagesLoaded} page(s), ` +
-        `${creatives.length} unique creative(s), ` +
-        `${advertisers.length} advertiser(s) for ${seed}.`,
+        `V0.6 completed. ` +
+        `${advertisers.length} advertiser(s) found from ${seed}; ` +
+        `${expandableAdvertisers.length} expanded; ` +
+        `${expansionCreatives.length} expansion creative(s); ` +
+        `${discoveredDomains.length} new unique domain(s).`,
 
       results,
     };
@@ -1451,7 +2238,7 @@ export async function runGoogleAdsTransparency(
     error
   ) {
     console.error(
-      "[SPY ADS V0.5 ERROR]",
+      "[SPY ADS V0.6 ERROR]",
       error
     );
 
@@ -1463,7 +2250,7 @@ export async function runGoogleAdsTransparency(
         error instanceof Error
           ? error.stack ||
             error.message
-          : "Unknown V0.5 error",
+          : "Unknown V0.6 error",
 
       results: [],
     };
