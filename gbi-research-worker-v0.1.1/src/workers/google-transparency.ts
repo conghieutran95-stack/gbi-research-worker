@@ -28,12 +28,12 @@ const MAX_PAGES = 100;
  * Browser request observed 10 advertisers/batch.
  */
 const ADVERTISER_BATCH_SIZE = 1;
-const MAX_ADVERTISERS_TO_EXPAND = 5;
+const MAX_ADVERTISERS_TO_EXPAND = 20;
 const MAX_ADVERTISER_PAGES = 3;
-const MAX_PREVIEWS_TO_FETCH = 30;
+const MAX_PREVIEWS_TO_FETCH = 120;
 const PREVIEW_FETCH_DELAY_MS = 450;
 
-// V0.6.3 rate-limit protection
+// V0.6.4 rate-limit protection
 const RPC_MAX_RETRIES = 6;
 const RPC_BASE_BACKOFF_MS = 2500;
 const RPC_MAX_BACKOFF_MS = 30000;
@@ -601,7 +601,7 @@ async function enrichTextCreativesFromPreviews(
       creative.domain = domain;
       resolved += 1;
       console.log(
-        `[SPY ADS V0.6.3] PREVIEW ${fetched}: ${creative.creative_id} -> ${domain}`
+        `[SPY ADS V0.6.4] PREVIEW ${fetched}: ${creative.creative_id} -> ${domain}`
       );
     }
 
@@ -609,7 +609,7 @@ async function enrichTextCreativesFromPreviews(
   }
 
   console.log(
-    `[SPY ADS V0.6.3] PREVIEWS FETCHED=${fetched}, DOMAINS RESOLVED=${resolved}`
+    `[SPY ADS V0.6.4] PREVIEWS FETCHED=${fetched}, DOMAINS RESOLVED=${resolved}`
   );
 
   return resolved;
@@ -906,10 +906,7 @@ async function captureInitialSearch(
 
   const url = `${BASE_URL}?${params.toString()}`;
 
-  console.log(
-    "[SPY ADS V0.6.3] DOMAIN:",
-    url
-  );
+  console.log("[SPY ADS V0.6.4] DOMAIN:", url);
 
   let capturedRequest: Request | undefined;
   let capturedResponse: Response | undefined;
@@ -917,28 +914,22 @@ async function captureInitialSearch(
   const onRequest = (request: Request) => {
     if (
       request.method() === "POST" &&
-      request.url().includes(SEARCH_CREATIVES_PATH)
+      request.url().includes(SEARCH_CREATIVES_PATH) &&
+      !capturedRequest
     ) {
-      if (!capturedRequest) {
-        capturedRequest = request;
-        console.log(
-          "[SPY ADS V0.6.3] SearchCreatives REQUEST captured"
-        );
-      }
+      capturedRequest = request;
+      console.log("[SPY ADS V0.6.4] SearchCreatives REQUEST captured");
     }
   };
 
   const onResponse = (response: Response) => {
     if (
       response.url().includes(SEARCH_CREATIVES_PATH) &&
-      response.status() === 200
+      response.status() === 200 &&
+      !capturedResponse
     ) {
-      if (!capturedResponse) {
-        capturedResponse = response;
-        console.log(
-          "[SPY ADS V0.6.3] SearchCreatives RESPONSE captured"
-        );
-      }
+      capturedResponse = response;
+      console.log("[SPY ADS V0.6.4] SearchCreatives RESPONSE captured");
     }
   };
 
@@ -961,18 +952,11 @@ async function captureInitialSearch(
       await sleep(250);
     }
 
-    const body = await page
-      .locator("body")
-      .innerText()
-      .catch(() => "");
-
+    const body = await page.locator("body").innerText().catch(() => "");
     const block = detectBlockState(body);
 
     if (block.status) {
-      throw new Error(
-        block.message ||
-        "Google blocked request."
-      );
+      throw new Error(block.message || "Google blocked request.");
     }
 
     if (!capturedRequest) {
@@ -983,16 +967,12 @@ async function captureInitialSearch(
 
     if (!capturedResponse) {
       console.warn(
-        `[SPY ADS V0.6.3] Request captured but response missing for ${seed}.`
+        `[SPY ADS V0.6.4] Request captured but response missing for ${seed}.`
       );
 
-      const response =
-        await capturedRequest.response().catch(() => null);
+      const response = await capturedRequest.response().catch(() => null);
 
-      if (
-        response &&
-        response.status() === 200
-      ) {
+      if (response && response.status() === 200) {
         capturedResponse = response;
       }
     }
@@ -1003,9 +983,7 @@ async function captureInitialSearch(
       );
     }
 
-    console.log(
-      `[SPY ADS V0.6.3] INITIAL CAPTURE OK: ${seed}`
-    );
+    console.log(`[SPY ADS V0.6.4] INITIAL CAPTURE OK: ${seed}`);
 
     return {
       request: capturedRequest,
@@ -1138,7 +1116,8 @@ async function requestRpcPage(
   endpoint: string,
   headers: Record<string, string>,
   basePayload: Record<string, any>,
-  token?: string
+  token?: string,
+  onRetry?: (status: number) => void
 ): Promise<{
   response: APIResponse;
   data: any;
@@ -1164,16 +1143,22 @@ async function requestRpcPage(
       data: body.toString(),
     });
 
-    const text = await response.text();
+    const responseText = await response.text();
     lastStatus = response.status();
-    lastText = text;
+    lastText = responseText;
 
     if (response.ok()) {
-      const data = parseGoogleResponseText(text);
+      const data = parseGoogleResponseText(responseText);
+
       if (!data) {
         throw new Error("Unable to parse SearchCreatives RPC response.");
       }
-      return { response, data, text };
+
+      return {
+        response,
+        data,
+        text: responseText,
+      };
     }
 
     const retryable =
@@ -1183,15 +1168,17 @@ async function requestRpcPage(
 
     if (!retryable || attempt >= RPC_MAX_RETRIES) {
       throw new Error(
-        `SearchCreatives HTTP ${response.status()}: ${text.slice(0, 500)}`
+        `SearchCreatives HTTP ${response.status()}: ${responseText.slice(0, 500)}`
       );
     }
+
+    onRetry?.(response.status());
 
     const retryAfter = response.headers()["retry-after"];
     const waitMs = retryDelayMs(attempt, retryAfter);
 
     console.warn(
-      `[SPY ADS V0.6.3] HTTP ${response.status()} - retry ` +
+      `[SPY ADS V0.6.4] HTTP ${response.status()} - retry ` +
       `${attempt + 1}/${RPC_MAX_RETRIES} after ${waitMs}ms`
     );
 
@@ -1236,7 +1223,10 @@ async function paginateRpc(
     string,
 
   maxPages:
-    number = MAX_PAGES
+    number = MAX_PAGES,
+
+  onRetry?:
+    (status: number) => void
 ): Promise<number> {
   const seenTokens =
     new Set<string>();
@@ -1260,7 +1250,8 @@ async function paginateRpc(
         endpoint,
         headers,
         payload,
-        token
+        token,
+        onRetry
       );
 
     extractCreativesRecursive(
@@ -1277,7 +1268,7 @@ async function paginateRpc(
       before;
 
     console.log(
-      `[SPY ADS V0.6.3] ${label} PAGE ${pagesLoaded}: +${added}, total=${output.length}`
+      `[SPY ADS V0.6.4] ${label} PAGE ${pagesLoaded}: +${added}, total=${output.length}`
     );
 
     const nextToken =
@@ -1297,7 +1288,7 @@ async function paginateRpc(
       )
     ) {
       console.log(
-        `[SPY ADS V0.6.3] ${label}: repeated token, stop.`
+        `[SPY ADS V0.6.4] ${label}: repeated token, stop.`
       );
 
       break;
@@ -1943,6 +1934,11 @@ export async function runGoogleAdsTransparency(
     country ||
     "anywhere";
 
+  const runStartedAt = Date.now();
+  let failedAdvertisers = 0;
+  let rateLimitRetries = 0;
+  let totalRpcRetries = 0;
+
   try {
     browser =
       await chromium.launch({
@@ -2115,7 +2111,7 @@ export async function runGoogleAdsTransparency(
       );
 
     console.log(
-      "========== V0.6.3 STEP 1 =========="
+      "========== V0.6.4 STEP 1 =========="
     );
 
     console.log(
@@ -2175,17 +2171,14 @@ export async function runGoogleAdsTransparency(
 
     for (
       let index = 0;
-      index <
-      batches.length;
+      index < batches.length;
       index++
     ) {
-      const batch =
-        batches[index];
+      const batch = batches[index];
 
       console.log(
-        `[SPY ADS V0.6.3] Advertiser batch ${
-          index + 1
-        }/${batches.length}: ${batch.length} advertiser(s)`
+        `[SPY ADS V0.6.4] Advertiser batch ${index + 1}/${batches.length}: ` +
+        `${batch.length} advertiser(s)`
       );
 
       const payload =
@@ -2194,24 +2187,35 @@ export async function runGoogleAdsTransparency(
           batch
         );
 
-      const loaded =
-        await paginateRpc(
-          context,
-          endpoint,
-          replayHeaders,
-          payload,
-          expansionCreatives,
-          expansionSeenIds,
-          `ADV-BATCH-${index + 1}`,
-          MAX_ADVERTISER_PAGES
+      try {
+        const loaded =
+          await paginateRpc(
+            context,
+            endpoint,
+            replayHeaders,
+            payload,
+            expansionCreatives,
+            expansionSeenIds,
+            `ADV-BATCH-${index + 1}`,
+            MAX_ADVERTISER_PAGES,
+            status => {
+              totalRpcRetries += 1;
+              if (status === 429) {
+                rateLimitRetries += 1;
+              }
+            }
+          );
+
+        advertiserPages += loaded;
+      } catch (error) {
+        failedAdvertisers += batch.length;
+
+        console.error(
+          `[SPY ADS V0.6.4] Advertiser batch ${index + 1} failed:`,
+          error instanceof Error ? error.message : error
         );
+      }
 
-      advertiserPages +=
-        loaded;
-
-      /*
-       * Be conservative between batches.
-       */
       await sleep(ADVERTISER_BATCH_DELAY_MS);
     }
 
@@ -2238,7 +2242,7 @@ export async function runGoogleAdsTransparency(
       );
 
     console.log(
-      "========== SPY ADS V0.6.3 RESULT =========="
+      "========== SPY ADS V0.6.4 RESULT =========="
     );
 
     console.log(
@@ -2283,8 +2287,27 @@ export async function runGoogleAdsTransparency(
       )
     );
 
+    const durationSeconds =
+      Math.round((Date.now() - runStartedAt) / 1000);
+
     console.log(
-      "========== END SPY ADS V0.6.3 =========="
+      "========== SPY ADS V0.6.4 SUMMARY =========="
+    );
+    console.log("SEED:", seed);
+    console.log("SOURCE CREATIVES:", domainCreatives.length);
+    console.log("SOURCE ADVERTISERS:", advertisers.length);
+    console.log("ADVERTISERS REQUESTED:", advertiserIds.length);
+    console.log("FAILED ADVERTISERS:", failedAdvertisers);
+    console.log("ADVERTISER PAGES:", advertiserPages);
+    console.log("EXPANSION CREATIVES:", expansionCreatives.length);
+    console.log("PREVIEW DOMAINS RESOLVED:", previewDomainsResolved);
+    console.log("UNIQUE DISCOVERED DOMAINS:", discoveredDomains.length);
+    console.log("RPC RETRIES:", totalRpcRetries);
+    console.log("429 RETRIES:", rateLimitRetries);
+    console.log("DURATION SECONDS:", durationSeconds);
+
+    console.log(
+      "========== END SPY ADS V0.6.4 =========="
     );
 
     /*
@@ -2321,7 +2344,7 @@ export async function runGoogleAdsTransparency(
 
           raw_payload: {
             mode:
-              "SPY_ADS_EXPANSION_V063_TEST",
+              "SPY_ADS_EXPANSION_V064_CONTROLLED",
 
             seed_domain:
               seed,
@@ -2346,6 +2369,18 @@ export async function runGoogleAdsTransparency(
 
             preview_domains_resolved:
               previewDomainsResolved,
+
+            failed_advertisers:
+              failedAdvertisers,
+
+            rpc_retries:
+              totalRpcRetries,
+
+            rate_limit_429_retries:
+              rateLimitRetries,
+
+            duration_seconds:
+              Math.round((Date.now() - runStartedAt) / 1000),
 
             discovered_domain:
               domain.domain,
@@ -2379,11 +2414,14 @@ export async function runGoogleAdsTransparency(
         "completed",
 
       message:
-        `V0.6.3 completed. ` +
+        `V0.6.4 completed. ` +
         `${advertisers.length} advertiser(s) found from ${seed}; ` +
-        `${advertiserIds.length} advertiser(s) tested; ` +
+        `${advertiserIds.length} advertiser(s) requested; ` +
+        `${failedAdvertisers} advertiser(s) failed; ` +
         `${expansionCreatives.length} expansion creative(s); ` +
-        `${discoveredDomains.length} new unique domain(s).`,
+        `${previewDomainsResolved} preview domain(s) resolved; ` +
+        `${discoveredDomains.length} new unique domain(s); ` +
+        `${rateLimitRetries} HTTP 429 retry/retries.`,
 
       results,
     };
@@ -2391,7 +2429,7 @@ export async function runGoogleAdsTransparency(
     error
   ) {
     console.error(
-      "[SPY ADS V0.6.3 ERROR]",
+      "[SPY ADS V0.6.4 ERROR]",
       error
     );
 
@@ -2403,7 +2441,7 @@ export async function runGoogleAdsTransparency(
         error instanceof Error
           ? error.stack ||
             error.message
-          : "Unknown V0.6.3 error",
+          : "Unknown V0.6.4 error",
 
       results: [],
     };
