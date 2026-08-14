@@ -18,6 +18,15 @@ import type {
 
 const BASE_URL = "https://adstransparency.google.com/";
 
+type CandidateLink = {
+  href: string;
+  text: string;
+  ariaLabel?: string;
+  parentText?: string;
+  tag?: string;
+  domain?: string;
+};
+
 function detectBlockState(
   text: string
 ): { status?: JobStatus; message?: string } {
@@ -48,10 +57,6 @@ function detectBlockState(
   return {};
 }
 
-/**
- * Try a locator safely.
- * Returns true only when the element exists, is visible and seed was submitted.
- */
 async function submitSearch(
   locator: Locator,
   seed: string
@@ -67,11 +72,9 @@ async function submitSearch(
 
     await el.click({ timeout: 3000 }).catch(() => {});
 
-    // Standard input / textarea
     try {
       await el.fill(seed, { timeout: 3000 });
     } catch {
-      // Some Google controls may behave differently.
       await el.press("Control+A").catch(() => {});
       await el.type(seed, { delay: 30 }).catch(() => {});
     }
@@ -84,14 +87,6 @@ async function submitSearch(
   }
 }
 
-/**
- * Find the Transparency Center search field using several strategies.
- *
- * Important:
- * - No CAPTCHA bypass.
- * - No hidden/private API interception.
- * - Only interacts with publicly rendered UI.
- */
 async function trySearch(
   page: Page,
   seed: string
@@ -100,15 +95,8 @@ async function trySearch(
   strategy?: string;
   diagnostics?: Record<string, unknown>;
 }> {
-  // Let Google client-side app hydrate.
   await page.waitForTimeout(2500);
 
-  /**
-   * Strategy 1:
-   * Accessible textbox whose surrounding name matches the actual
-   * current Google wording:
-   * "Search by advertiser or website"
-   */
   const roleTextbox = page.getByRole("textbox");
 
   const textboxCount = await roleTextbox.count().catch(() => 0);
@@ -142,10 +130,6 @@ async function trySearch(
     } catch {}
   }
 
-  /**
-   * Strategy 2:
-   * Exact / partial placeholder and ARIA strings.
-   */
   const semanticCandidates: Locator[] = [
     page.getByPlaceholder(/search by advertiser or website/i),
     page.getByPlaceholder(/advertiser.*website/i),
@@ -175,10 +159,6 @@ async function trySearch(
     }
   }
 
-  /**
-   * Strategy 3:
-   * Inspect visible inputs, excluding obviously unrelated controls.
-   */
   const inputs = page.locator(
     'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="file"])'
   );
@@ -200,13 +180,9 @@ async function trySearch(
       const aria =
         (await input.getAttribute("aria-label").catch(() => null)) || "";
 
-      const autocomplete =
-        (await input.getAttribute("autocomplete").catch(() => null)) || "";
-
       const combined =
-        `${type} ${placeholder} ${aria} ${autocomplete}`.toLowerCase();
+        `${type} ${placeholder} ${aria}`.toLowerCase();
 
-      // Skip likely auth fields.
       if (
         combined.includes("password") ||
         combined.includes("email") ||
@@ -225,82 +201,157 @@ async function trySearch(
     } catch {}
   }
 
-  /**
-   * Strategy 4:
-   * Some JS applications use textarea or contenteditable controls.
-   */
-  const alternateControls = [
-    page.locator("textarea"),
-    page.locator('[contenteditable="true"]'),
-  ];
-
-  for (let i = 0; i < alternateControls.length; i++) {
-    const group = alternateControls[i];
-    const count = await group.count().catch(() => 0);
-
-    for (let j = 0; j < count; j++) {
-      if (await submitSearch(group.nth(j), seed)) {
-        return {
-          success: true,
-          strategy: `alternate-${i}-${j}`,
-        };
-      }
-    }
-  }
-
-  /**
-   * Return diagnostics so next failure tells us WHAT Railway actually saw,
-   * instead of only saying "search not found".
-   */
-  const diagnostics = await page
-    .evaluate(() => {
-      const els = Array.from(
-        document.querySelectorAll(
-          'input, textarea, [contenteditable="true"], [role="textbox"]'
-        )
-      );
-
-      return els.slice(0, 30).map((el: any) => ({
-        tag: el.tagName,
-        type: el.getAttribute?.("type"),
-        placeholder: el.getAttribute?.("placeholder"),
-        ariaLabel: el.getAttribute?.("aria-label"),
-        role: el.getAttribute?.("role"),
-        contentEditable: el.getAttribute?.("contenteditable"),
-        visible:
-          !!(
-            el.offsetWidth ||
-            el.offsetHeight ||
-            el.getClientRects?.().length
-          ),
-      }));
-    })
-    .catch(() => []);
-
   return {
     success: false,
     diagnostics: {
       url: page.url(),
       title: await page.title().catch(() => ""),
-      controls: diagnostics,
     },
   };
 }
 
-function isGoogleInternal(url: string): boolean {
+function isGoogleNoise(url: string): boolean {
   try {
     const h = new URL(url).hostname.toLowerCase();
 
-    return (
-      h.endsWith("google.com") ||
-      h.endsWith("gstatic.com") ||
-      h.endsWith("googleusercontent.com") ||
-      h.endsWith("googlesyndication.com") ||
-      h.endsWith("doubleclick.net")
+    const noiseHosts = [
+      "google.com",
+      "www.google.com",
+      "support.google.com",
+      "safety.google",
+      "blog.google",
+      "youtube.com",
+      "www.youtube.com",
+      "gstatic.com",
+      "googleusercontent.com",
+      "googlesyndication.com",
+      "doubleclick.net",
+      "accounts.google.com",
+      "policies.google.com",
+    ];
+
+    return noiseHosts.some(
+      (host) => h === host || h.endsWith(`.${host}`)
     );
   } catch {
     return true;
   }
+}
+
+async function collectCandidateLinks(
+  page: Page
+): Promise<CandidateLink[]> {
+  const raw = await page
+    .locator("a[href]")
+    .evaluateAll((els) => {
+      return els.slice(0, 300).map((el) => {
+        const a = el as HTMLAnchorElement;
+
+        const parent =
+          a.closest(
+            'article, [role="listitem"], [role="row"], [role="link"], mat-card, div'
+          ) || a.parentElement;
+
+        return {
+          href: a.href || "",
+          text: (a.innerText || a.textContent || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 500),
+
+          ariaLabel: (a.getAttribute("aria-label") || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 300),
+
+          parentText: (parent?.textContent || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 1200),
+
+          tag: parent?.tagName || "",
+        };
+      });
+    })
+    .catch(() => []);
+
+  const result: CandidateLink[] = [];
+
+  for (const item of raw) {
+    if (!item.href) continue;
+
+    let domain: string | undefined;
+
+    try {
+      domain = normalizeUrlToDomain(item.href);
+    } catch {}
+
+    result.push({
+      ...item,
+      domain,
+    });
+  }
+
+  return result;
+}
+
+function scoreCandidate(
+  candidate: CandidateLink,
+  seed: string
+): number {
+  let score = 0;
+
+  const haystack = [
+    candidate.href,
+    candidate.text,
+    candidate.ariaLabel,
+    candidate.parentText,
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  const normalizedSeed =
+    normalizeUrlToDomain(seed)?.toLowerCase() ||
+    seed.toLowerCase();
+
+  if (candidate.domain === normalizedSeed) {
+    score += 100;
+  }
+
+  if (haystack.includes(normalizedSeed)) {
+    score += 50;
+  }
+
+  if (
+    haystack.includes("advertiser") ||
+    haystack.includes("advertiser details")
+  ) {
+    score += 20;
+  }
+
+  if (
+    haystack.includes("ad") ||
+    haystack.includes("advertisement") ||
+    haystack.includes("creative")
+  ) {
+    score += 10;
+  }
+
+  if (
+    candidate.href.includes("/advertiser/") ||
+    candidate.href.includes("advertiser?")
+  ) {
+    score += 40;
+  }
+
+  if (
+    candidate.parentText &&
+    candidate.parentText.length > 80
+  ) {
+    score += 5;
+  }
+
+  return score;
 }
 
 export async function runGoogleAdsTransparency(
@@ -316,7 +367,8 @@ export async function runGoogleAdsTransparency(
 
   try {
     browser = await chromium.launch({
-      headless: process.env.PLAYWRIGHT_HEADLESS !== "false",
+      headless:
+        process.env.PLAYWRIGHT_HEADLESS !== "false",
     });
 
     context = await browser.newContext({
@@ -344,7 +396,6 @@ export async function runGoogleAdsTransparency(
       timeout: 45000,
     });
 
-    // Allow SPA rendering.
     await page.waitForTimeout(3000);
 
     let body = await page
@@ -369,20 +420,13 @@ export async function runGoogleAdsTransparency(
 
         message:
           "Search control not found. " +
-          `URL=${page.url()} ` +
-          `Diagnostics=${JSON.stringify(search.diagnostics)}`,
+          JSON.stringify(search.diagnostics),
 
         results: [],
       };
     }
 
-    // Wait for Google results/navigation to update.
-    await Promise.race([
-      page.waitForLoadState("networkidle", {
-        timeout: 10000,
-      }),
-      page.waitForTimeout(6000),
-    ]).catch(() => {});
+    await page.waitForTimeout(7000);
 
     body = await page
       .locator("body")
@@ -398,86 +442,111 @@ export async function runGoogleAdsTransparency(
       };
     }
 
-    /**
-     * Public links currently rendered by Google page.
-     */
-    const hrefs = await page
-      .locator("a[href]")
-      .evaluateAll((els) =>
-        els
-          .map((el) => (el as HTMLAnchorElement).href)
-          .filter(Boolean)
-      )
-      .catch(() => []);
+    const candidates =
+      await collectCandidateLinks(page);
+
+    const scored = candidates
+      .map((candidate) => ({
+        ...candidate,
+        score: scoreCandidate(candidate, seed),
+      }))
+      .sort((a, b) => b.score - a.score);
 
     /**
-     * Also collect plain HTTP URLs rendered as text.
+     * Only high-confidence domains become actual project results.
+     * Everything else stays diagnostic only.
      */
-    const textUrls = extractHttpUrls(body);
-
-    const urls = [
-      ...new Set([
-        ...hrefs,
-        ...textUrls,
-      ]),
-    ];
+    const strongCandidates = scored.filter(
+      (candidate) =>
+        candidate.score >= 50 &&
+        candidate.domain &&
+        !isGoogleNoise(candidate.href)
+    );
 
     const results: DiscoveryResult[] = [];
 
     const seen = new Set<string>();
 
-    for (const url of urls) {
-      if (isGoogleInternal(url)) continue;
+    for (const candidate of strongCandidates) {
+      if (!candidate.domain) continue;
 
-      const domain = normalizeUrlToDomain(url);
+      if (seen.has(candidate.domain)) {
+        continue;
+      }
 
-      if (!domain) continue;
-      if (seen.has(domain)) continue;
-
-      seen.add(domain);
+      seen.add(candidate.domain);
 
       results.push({
-        provider: "google_ads_transparency",
+        provider:
+          "google_ads_transparency",
 
-        domain,
+        domain:
+          candidate.domain,
 
-        landing_url: url,
+        landing_url:
+          candidate.href,
 
         country,
 
-        source_url: page.url(),
+        source_url:
+          page.url(),
 
-        source_ref: seed,
+        source_ref:
+          seed,
 
-        observed_at: new Date().toISOString(),
+        observed_at:
+          new Date().toISOString(),
 
         raw_payload: {
           seed,
 
-          search_strategy: search.strategy,
+          search_strategy:
+            search.strategy,
 
-          page_title: await page
-            .title()
-            .catch(() => undefined),
+          candidate_score:
+            candidate.score,
+
+          anchor_text:
+            candidate.text,
+
+          aria_label:
+            candidate.ariaLabel,
+
+          parent_text:
+            candidate.parentText,
+
+          page_title:
+            await page
+              .title()
+              .catch(() => undefined),
         },
       });
     }
 
+    /**
+     * If we do not yet have a trustworthy domain,
+     * return DOM diagnostics instead of polluting database.
+     */
     if (!results.length) {
-      /**
-       * This does NOT mean search failed.
-       *
-       * Google may expose advertiser pages / creatives without rendering
-       * final external landing URLs directly in the DOM.
-       */
+      const diagnostics = scored
+        .slice(0, 25)
+        .map((item) => ({
+          score: item.score,
+          href: item.href,
+          domain: item.domain,
+          text: item.text,
+          ariaLabel: item.ariaLabel,
+          parentText: item.parentText,
+        }));
+
       return {
         status: "manual_required",
 
         message:
-          "Google Ads Transparency search succeeded " +
-          `using strategy "${search.strategy}", ` +
-          "but no publicly rendered external landing domains were found. " +
-          `Current URL: ${page.url()}`,
+          "Search succeeded but no high-confidence advertiser/project domain was identified. " +
+          `strategy=${search.strategy}; ` +
+          `url=${page.url()}; ` +
+          `candidates=${JSON.stringify(diagnostics)}`,
 
         results: [],
       };
@@ -488,7 +557,7 @@ export async function runGoogleAdsTransparency(
 
       message:
         `Search succeeded via ${search.strategy}. ` +
-        `Found ${results.length} unique external domain(s).`,
+        `Found ${results.length} high-confidence project domain(s).`,
 
       results,
     };
@@ -505,11 +574,15 @@ export async function runGoogleAdsTransparency(
     };
   } finally {
     if (context) {
-      await context.close().catch(() => {});
+      await context
+        .close()
+        .catch(() => {});
     }
 
     if (browser) {
-      await browser.close().catch(() => {});
+      await browser
+        .close()
+        .catch(() => {});
     }
   }
 }
