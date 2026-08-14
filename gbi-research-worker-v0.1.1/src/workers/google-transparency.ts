@@ -2,14 +2,8 @@ import {
   chromium,
   type Browser,
   type BrowserContext,
-  type Locator,
   type Page,
 } from "playwright";
-
-import {
-  extractHttpUrls,
-  normalizeUrlToDomain,
-} from "../lib/domain.js";
 
 import type {
   DiscoveryResult,
@@ -18,18 +12,34 @@ import type {
 
 const BASE_URL = "https://adstransparency.google.com/";
 
-type CandidateLink = {
-  href: string;
-  text: string;
-  ariaLabel?: string;
-  parentText?: string;
-  tag?: string;
-  domain?: string;
+type AdvertiserRow = {
+  advertiser_name: string;
+  advertiser_id?: string;
+
+  text_ads_count: number;
+
+  first_seen?: string;
+  last_seen?: string;
+
+  advertiser_type:
+    | "BRAND"
+    | "UNKNOWN"
+    | "DISCOVERY_ADVERTISER";
+
+  expand: boolean;
+
+  confidence:
+    | "HIGH"
+    | "MEDIUM"
+    | "LOW";
 };
 
 function detectBlockState(
   text: string
-): { status?: JobStatus; message?: string } {
+): {
+  status?: JobStatus;
+  message?: string;
+} {
   const v = text.toLowerCase();
 
   if (
@@ -50,309 +60,568 @@ function detectBlockState(
   ) {
     return {
       status: "blocked",
-      message: "Provider blocked or rate-limited this request.",
+      message: "Google blocked or rate-limited this request.",
     };
   }
 
   return {};
 }
 
-async function submitSearch(
-  locator: Locator,
-  seed: string
-): Promise<boolean> {
-  try {
-    if ((await locator.count()) === 0) return false;
+/* -------------------------------------------------------
+   NORMALIZATION
+------------------------------------------------------- */
 
-    const el = locator.first();
-
-    if (!(await el.isVisible({ timeout: 1800 }))) {
-      return false;
-    }
-
-    await el.click({ timeout: 3000 }).catch(() => {});
-
-    try {
-      await el.fill(seed, { timeout: 3000 });
-    } catch {
-      await el.press("Control+A").catch(() => {});
-      await el.type(seed, { delay: 30 }).catch(() => {});
-    }
-
-    await el.press("Enter", { timeout: 3000 }).catch(() => {});
-
-    return true;
-  } catch {
-    return false;
-  }
+function normalizeText(value?: string | null): string {
+  return (value || "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-async function trySearch(
-  page: Page,
-  seed: string
-): Promise<{
-  success: boolean;
-  strategy?: string;
-  diagnostics?: Record<string, unknown>;
-}> {
-  await page.waitForTimeout(2500);
+function normalizeBrandName(value: string): string {
+  return value
+    .toLowerCase()
 
-  const roleTextbox = page.getByRole("textbox");
+    // remove legal company suffixes
+    .replace(
+      /\b(llc|ltd|limited|inc|incorporated|corp|corporation|company|co)\b/g,
+      ""
+    )
 
-  const textboxCount = await roleTextbox.count().catch(() => 0);
+    .replace(/[^a-z0-9]/g, "")
+    .trim();
+}
 
-  for (let i = 0; i < textboxCount; i++) {
-    const textbox = roleTextbox.nth(i);
+function domainBrand(domain: string): string {
+  const host = domain
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .split("/")[0];
 
-    try {
-      if (!(await textbox.isVisible({ timeout: 800 }))) continue;
-
-      const placeholder =
-        (await textbox.getAttribute("placeholder").catch(() => null)) || "";
-
-      const aria =
-        (await textbox.getAttribute("aria-label").catch(() => null)) || "";
-
-      const text = `${placeholder} ${aria}`.toLowerCase();
-
-      if (
-        text.includes("advertiser") ||
-        text.includes("website") ||
-        text.includes("search")
-      ) {
-        if (await submitSearch(textbox, seed)) {
-          return {
-            success: true,
-            strategy: `role-textbox-${i}`,
-          };
-        }
-      }
-    } catch {}
-  }
-
-  const semanticCandidates: Locator[] = [
-    page.getByPlaceholder(/search by advertiser or website/i),
-    page.getByPlaceholder(/advertiser.*website/i),
-    page.getByPlaceholder(/search/i),
-
-    page.getByLabel(/search by advertiser or website/i),
-    page.getByLabel(/advertiser.*website/i),
-    page.getByLabel(/search/i),
-
-    page.locator(
-      'input[placeholder*="advertiser" i][placeholder*="website" i]'
-    ),
-
-    page.locator(
-      'input[aria-label*="advertiser" i][aria-label*="website" i]'
-    ),
-
-    page.locator('input[type="search"]'),
-  ];
-
-  for (let i = 0; i < semanticCandidates.length; i++) {
-    if (await submitSearch(semanticCandidates[i], seed)) {
-      return {
-        success: true,
-        strategy: `semantic-${i}`,
-      };
-    }
-  }
-
-  const inputs = page.locator(
-    'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="file"])'
+  return normalizeBrandName(
+    host.split(".")[0]
   );
+}
 
-  const inputCount = await inputs.count().catch(() => 0);
+/* -------------------------------------------------------
+   BRAND CLASSIFIER
+------------------------------------------------------- */
 
-  for (let i = 0; i < inputCount; i++) {
-    const input = inputs.nth(i);
+function classifyAdvertiser(
+  advertiserName: string,
+  seedDomain: string,
+  adsCount: number
+): {
+  type:
+    | "BRAND"
+    | "UNKNOWN"
+    | "DISCOVERY_ADVERTISER";
 
-    try {
-      if (!(await input.isVisible({ timeout: 700 }))) continue;
+  expand: boolean;
 
-      const type =
-        (await input.getAttribute("type").catch(() => null)) || "";
+  confidence:
+    | "HIGH"
+    | "MEDIUM"
+    | "LOW";
+} {
+  const advertiser =
+    normalizeBrandName(advertiserName);
 
-      const placeholder =
-        (await input.getAttribute("placeholder").catch(() => null)) || "";
+  const brand =
+    domainBrand(seedDomain);
 
-      const aria =
-        (await input.getAttribute("aria-label").catch(() => null)) || "";
+  /*
+   * Strong signal:
+   *
+   * COMFRT
+   * COMFRT LLC
+   * COMFRT INC
+   *
+   * vs comfrt.com
+   */
+  if (
+    advertiser &&
+    brand &&
+    (
+      advertiser === brand ||
+      advertiser.includes(brand) ||
+      brand.includes(advertiser)
+    )
+  ) {
+    return {
+      type: "BRAND",
+      expand: false,
+      confidence: "HIGH",
+    };
+  }
 
-      const combined =
-        `${type} ${placeholder} ${aria}`.toLowerCase();
-
-      if (
-        combined.includes("password") ||
-        combined.includes("email") ||
-        combined.includes("signin") ||
-        combined.includes("sign in")
-      ) {
-        continue;
-      }
-
-      if (await submitSearch(input, seed)) {
-        return {
-          success: true,
-          strategy: `generic-input-${i}`,
-        };
-      }
-    } catch {}
+  /*
+   * Important:
+   *
+   * We do NOT classify an advertiser as affiliate
+   * only because it has many ads.
+   *
+   * Multi-domain classification will become stronger
+   * after ADVERTISER_SEARCH is implemented.
+   */
+  if (adsCount >= 20) {
+    return {
+      type: "UNKNOWN",
+      expand: true,
+      confidence: "LOW",
+    };
   }
 
   return {
-    success: false,
-    diagnostics: {
-      url: page.url(),
-      title: await page.title().catch(() => ""),
-    },
+    type: "UNKNOWN",
+    expand: true,
+    confidence: "MEDIUM",
   };
 }
 
-function isGoogleNoise(url: string): boolean {
-  try {
-    const h = new URL(url).hostname.toLowerCase();
+/* -------------------------------------------------------
+   DATE EXTRACTION
+------------------------------------------------------- */
 
-    const noiseHosts = [
-      "google.com",
-      "www.google.com",
-      "support.google.com",
-      "safety.google",
-      "blog.google",
-      "youtube.com",
-      "www.youtube.com",
-      "gstatic.com",
-      "googleusercontent.com",
-      "googlesyndication.com",
-      "doubleclick.net",
-      "accounts.google.com",
-      "policies.google.com",
-    ];
+function extractDates(
+  text: string
+): string[] {
+  const patterns = [
+    /\b\d{4}-\d{2}-\d{2}\b/g,
 
-    return noiseHosts.some(
-      (host) => h === host || h.endsWith(`.${host}`)
+    /\b\d{1,2}\/\d{1,2}\/\d{4}\b/g,
+
+    /\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b/gi,
+  ];
+
+  const found: string[] = [];
+
+  for (const pattern of patterns) {
+    const matches =
+      text.match(pattern) || [];
+
+    found.push(...matches);
+  }
+
+  return [
+    ...new Set(found),
+  ];
+}
+
+/* -------------------------------------------------------
+   ADVERTISER ID EXTRACTION
+------------------------------------------------------- */
+
+function extractAdvertiserId(
+  value: string
+): string | undefined {
+  /*
+   * Google advertiser IDs commonly appear
+   * in URLs / advertiser links.
+   *
+   * We deliberately keep this permissive for
+   * diagnostics because Google's UI may change.
+   */
+
+  const match =
+    value.match(
+      /\bAR[A-Z0-9_-]{5,}\b/i
     );
-  } catch {
-    return true;
+
+  return match
+    ? match[0]
+    : undefined;
+}
+
+/* -------------------------------------------------------
+   LOAD MORE / SCROLL
+------------------------------------------------------- */
+
+async function expandResults(
+  page: Page
+): Promise<void> {
+  /*
+   * Ads Transparency uses dynamic rendering.
+   *
+   * Scroll several times to allow additional
+   * result cards to render.
+   */
+
+  for (let i = 0; i < 8; i++) {
+    await page.evaluate(() => {
+      window.scrollTo(
+        0,
+        document.body.scrollHeight
+      );
+    });
+
+    await page.waitForTimeout(1200);
+  }
+
+  /*
+   * Try common "load more" controls.
+   */
+
+  const buttons = [
+    page.getByRole(
+      "button",
+      { name: /load more/i }
+    ),
+
+    page.getByRole(
+      "button",
+      { name: /show more/i }
+    ),
+
+    page.getByText(
+      /load more/i
+    ),
+  ];
+
+  for (const locator of buttons) {
+    try {
+      if (
+        await locator
+          .first()
+          .isVisible({
+            timeout: 800,
+          })
+      ) {
+        await locator
+          .first()
+          .click();
+
+        await page.waitForTimeout(2000);
+      }
+    } catch {}
   }
 }
 
-async function collectCandidateLinks(
+/* -------------------------------------------------------
+   DOM DIAGNOSTICS
+------------------------------------------------------- */
+
+async function collectPageCandidates(
   page: Page
-): Promise<CandidateLink[]> {
-  const raw = await page
-    .locator("a[href]")
-    .evaluateAll((els) => {
-      return els.slice(0, 300).map((el) => {
-        const a = el as HTMLAnchorElement;
+): Promise<any[]> {
+  return page
+    .evaluate(() => {
+      const selectors = [
+        "a[href]",
+        "[role='link']",
+        "[role='listitem']",
+        "article",
+      ];
 
-        const parent =
-          a.closest(
-            'article, [role="listitem"], [role="row"], [role="link"], mat-card, div'
-          ) || a.parentElement;
+      const nodes =
+        Array.from(
+          document.querySelectorAll(
+            selectors.join(",")
+          )
+        );
 
-        return {
-          href: a.href || "",
-          text: (a.innerText || a.textContent || "")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 500),
+      return nodes
+        .slice(0, 800)
+        .map((node: any) => {
+          const anchor =
+            node.tagName === "A"
+              ? node
+              : node.querySelector?.(
+                  "a[href]"
+                );
 
-          ariaLabel: (a.getAttribute("aria-label") || "")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 300),
+          return {
+            tag:
+              node.tagName,
 
-          parentText: (parent?.textContent || "")
-            .replace(/\s+/g, " ")
-            .trim()
-            .slice(0, 1200),
+            text:
+              (
+                node.innerText ||
+                node.textContent ||
+                ""
+              )
+                .replace(/\s+/g, " ")
+                .trim()
+                .slice(0, 2500),
 
-          tag: parent?.tagName || "",
-        };
-      });
+            href:
+              anchor?.href || "",
+
+            ariaLabel:
+              node.getAttribute?.(
+                "aria-label"
+              ) || "",
+
+            role:
+              node.getAttribute?.(
+                "role"
+              ) || "",
+          };
+        })
+        .filter(
+          (x: any) =>
+            x.text ||
+            x.href
+        );
     })
     .catch(() => []);
+}
 
-  const result: CandidateLink[] = [];
+/* -------------------------------------------------------
+   PARSE ADVERTISERS
+------------------------------------------------------- */
 
-  for (const item of raw) {
-    if (!item.href) continue;
+async function parseAdvertisers(
+  page: Page,
+  seedDomain: string
+): Promise<{
+  advertisers: AdvertiserRow[];
+  diagnostics: any[];
+}> {
+  const candidates =
+    await collectPageCandidates(page);
 
-    let domain: string | undefined;
+  type TempAdvertiser = {
+    name: string;
+    id?: string;
 
-    try {
-      domain = normalizeUrlToDomain(item.href);
-    } catch {}
+    count: number;
 
-    result.push({
-      ...item,
-      domain,
+    dates: string[];
+
+    samples: string[];
+  };
+
+  const advertiserMap =
+    new Map<
+      string,
+      TempAdvertiser
+    >();
+
+  /*
+   * Look for advertiser result links/cards.
+   */
+
+  for (const candidate of candidates) {
+    const combined =
+      normalizeText(
+        `${candidate.text} ${candidate.href} ${candidate.ariaLabel}`
+      );
+
+    const lower =
+      combined.toLowerCase();
+
+    const advertiserId =
+      extractAdvertiserId(
+        combined
+      );
+
+    const looksLikeAdvertiser =
+      advertiserId ||
+      lower.includes(
+        "advertiser"
+      );
+
+    if (!looksLikeAdvertiser) {
+      continue;
+    }
+
+    /*
+     * Try extracting advertiser name.
+     *
+     * Google often renders advertiser name
+     * near the advertiser link/card.
+     */
+
+    let advertiserName =
+      normalizeText(
+        candidate.text
+      );
+
+    advertiserName =
+      advertiserName
+        .replace(
+          /advertiser details/gi,
+          ""
+        )
+        .replace(
+          /advertiser/gi,
+          ""
+        )
+        .trim();
+
+    /*
+     * Avoid giant card text becoming
+     * advertiser name.
+     */
+
+    if (
+      advertiserName.length > 160
+    ) {
+      advertiserName =
+        advertiserName
+          .split(/[|•·]/)[0]
+          .trim();
+    }
+
+    if (
+      !advertiserName &&
+      !advertiserId
+    ) {
+      continue;
+    }
+
+    const key =
+      advertiserId ||
+      advertiserName.toLowerCase();
+
+    const dates =
+      extractDates(
+        combined
+      );
+
+    const existing =
+      advertiserMap.get(key);
+
+    if (existing) {
+      existing.count += 1;
+
+      existing.dates.push(
+        ...dates
+      );
+
+      if (
+        existing.samples.length < 3
+      ) {
+        existing.samples.push(
+          combined.slice(
+            0,
+            800
+          )
+        );
+      }
+
+      continue;
+    }
+
+    advertiserMap.set(
+      key,
+      {
+        name:
+          advertiserName ||
+          advertiserId ||
+          "Unknown Advertiser",
+
+        id:
+          advertiserId,
+
+        count: 1,
+
+        dates,
+
+        samples: [
+          combined.slice(
+            0,
+            800
+          ),
+        ],
+      }
+    );
+  }
+
+  const advertisers:
+    AdvertiserRow[] = [];
+
+  for (
+    const item
+    of advertiserMap.values()
+  ) {
+    const uniqueDates =
+      [
+        ...new Set(
+          item.dates
+        ),
+      ].sort();
+
+    const classification =
+      classifyAdvertiser(
+        item.name,
+        seedDomain,
+        item.count
+      );
+
+    advertisers.push({
+      advertiser_name:
+        item.name,
+
+      advertiser_id:
+        item.id,
+
+      text_ads_count:
+        item.count,
+
+      first_seen:
+        uniqueDates[0],
+
+      last_seen:
+        uniqueDates.length
+          ? uniqueDates[
+              uniqueDates.length - 1
+            ]
+          : undefined,
+
+      advertiser_type:
+        classification.type,
+
+      expand:
+        classification.expand,
+
+      confidence:
+        classification.confidence,
     });
   }
 
-  return result;
+  advertisers.sort(
+    (a, b) =>
+      b.text_ads_count -
+      a.text_ads_count
+  );
+
+  /*
+   * Keep diagnostic candidates.
+   *
+   * If parsing isn't accurate yet,
+   * the next test tells us exactly
+   * what Google's DOM contains.
+   */
+
+  const diagnostics =
+    candidates
+      .filter((x) => {
+        const text =
+          `${x.text} ${x.href}`
+            .toLowerCase();
+
+        return (
+          text.includes(
+            "advertiser"
+          ) ||
+          /AR[A-Z0-9_-]{5,}/i.test(
+            text
+          )
+        );
+      })
+      .slice(0, 50);
+
+  return {
+    advertisers,
+    diagnostics,
+  };
 }
 
-function scoreCandidate(
-  candidate: CandidateLink,
-  seed: string
-): number {
-  let score = 0;
-
-  const haystack = [
-    candidate.href,
-    candidate.text,
-    candidate.ariaLabel,
-    candidate.parentText,
-  ]
-    .join(" ")
-    .toLowerCase();
-
-  const normalizedSeed =
-    normalizeUrlToDomain(seed)?.toLowerCase() ||
-    seed.toLowerCase();
-
-  if (candidate.domain === normalizedSeed) {
-    score += 100;
-  }
-
-  if (haystack.includes(normalizedSeed)) {
-    score += 50;
-  }
-
-  if (
-    haystack.includes("advertiser") ||
-    haystack.includes("advertiser details")
-  ) {
-    score += 20;
-  }
-
-  if (
-    haystack.includes("ad") ||
-    haystack.includes("advertisement") ||
-    haystack.includes("creative")
-  ) {
-    score += 10;
-  }
-
-  if (
-    candidate.href.includes("/advertiser/") ||
-    candidate.href.includes("advertiser?")
-  ) {
-    score += 40;
-  }
-
-  if (
-    candidate.parentText &&
-    candidate.parentText.length > 80
-  ) {
-    score += 5;
-  }
-
-  return score;
-}
+/* -------------------------------------------------------
+   MAIN DOMAIN SEARCH
+------------------------------------------------------- */
 
 export async function runGoogleAdsTransparency(
   seed: string,
@@ -362,212 +631,249 @@ export async function runGoogleAdsTransparency(
   message?: string;
   results: DiscoveryResult[];
 }> {
-  let browser: Browser | undefined;
-  let context: BrowserContext | undefined;
+  let browser:
+    Browser | undefined;
+
+  let context:
+    BrowserContext | undefined;
 
   try {
-    browser = await chromium.launch({
-      headless:
-        process.env.PLAYWRIGHT_HEADLESS !== "false",
-    });
+    browser =
+      await chromium.launch({
+        headless:
+          process.env
+            .PLAYWRIGHT_HEADLESS !==
+          "false",
+      });
 
-    context = await browser.newContext({
-      locale: "en-US",
+    context =
+      await browser.newContext({
+        locale: "en-US",
 
-      viewport: {
-        width: 1440,
-        height: 1000,
-      },
+        viewport: {
+          width: 1440,
+          height: 1100,
+        },
 
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-        "AppleWebKit/537.36 (KHTML, like Gecko) " +
-        "Chrome/131.0.0.0 Safari/537.36",
-    });
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+          "AppleWebKit/537.36 (KHTML, like Gecko) " +
+          "Chrome/131.0.0.0 Safari/537.36",
+      });
 
-    const page = await context.newPage();
+    const page =
+      await context.newPage();
 
-    const startUrl = country
-      ? `${BASE_URL}?region=${encodeURIComponent(country)}`
-      : BASE_URL;
-
-    await page.goto(startUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 45000,
-    });
-
-    await page.waitForTimeout(3000);
-
-    let body = await page
-      .locator("body")
-      .innerText()
-      .catch(() => "");
-
-    let block = detectBlockState(body);
-
-    if (block.status) {
-      return {
-        ...block,
-        results: [],
-      };
-    }
-
-    const search = await trySearch(page, seed);
-
-    if (!search.success) {
-      return {
-        status: "manual_required",
-
-        message:
-          "Search control not found. " +
-          JSON.stringify(search.diagnostics),
-
-        results: [],
-      };
-    }
-
-    await page.waitForTimeout(7000);
-
-    body = await page
-      .locator("body")
-      .innerText()
-      .catch(() => "");
-
-    block = detectBlockState(body);
-
-    if (block.status) {
-      return {
-        ...block,
-        results: [],
-      };
-    }
-
-    const candidates =
-      await collectCandidateLinks(page);
-
-    const scored = candidates
-      .map((candidate) => ({
-        ...candidate,
-        score: scoreCandidate(candidate, seed),
-      }))
-      .sort((a, b) => b.score - a.score);
-
-    /**
-     * Only high-confidence domains become actual project results.
-     * Everything else stays diagnostic only.
+    /*
+     * IMPORTANT:
+     *
+     * Direct DOMAIN query.
+     *
+     * TEXT only.
+     *
+     * No need to interact with search box.
      */
-    const strongCandidates = scored.filter(
-      (candidate) =>
-        candidate.score >= 50 &&
-        candidate.domain &&
-        !isGoogleNoise(candidate.href)
+
+    const params =
+      new URLSearchParams();
+
+    params.set(
+      "domain",
+      seed
     );
 
-    const results: DiscoveryResult[] = [];
+    params.set(
+      "format",
+      "TEXT"
+    );
 
-    const seen = new Set<string>();
+    params.set(
+      "region",
+      country || "anywhere"
+    );
 
-    for (const candidate of strongCandidates) {
-      if (!candidate.domain) continue;
+    const url =
+      `${BASE_URL}?${params.toString()}`;
 
-      if (seen.has(candidate.domain)) {
-        continue;
+    await page.goto(
+      url,
+      {
+        waitUntil:
+          "domcontentloaded",
+
+        timeout:
+          45000,
       }
+    );
 
-      seen.add(candidate.domain);
+    /*
+     * Allow Angular / SPA to render.
+     */
 
-      results.push({
-        provider:
-          "google_ads_transparency",
+    await page.waitForTimeout(
+      5000
+    );
 
-        domain:
-          candidate.domain,
+    let body =
+      await page
+        .locator("body")
+        .innerText()
+        .catch(
+          () => ""
+        );
 
-        landing_url:
-          candidate.href,
+    const block =
+      detectBlockState(
+        body
+      );
 
-        country,
-
-        source_url:
-          page.url(),
-
-        source_ref:
-          seed,
-
-        observed_at:
-          new Date().toISOString(),
-
-        raw_payload: {
-          seed,
-
-          search_strategy:
-            search.strategy,
-
-          candidate_score:
-            candidate.score,
-
-          anchor_text:
-            candidate.text,
-
-          aria_label:
-            candidate.ariaLabel,
-
-          parent_text:
-            candidate.parentText,
-
-          page_title:
-            await page
-              .title()
-              .catch(() => undefined),
-        },
-      });
+    if (block.status) {
+      return {
+        ...block,
+        results: [],
+      };
     }
 
-    /**
-     * If we do not yet have a trustworthy domain,
-     * return DOM diagnostics instead of polluting database.
+    /*
+     * Load more dynamic cards.
      */
-    if (!results.length) {
-      const diagnostics = scored
-        .slice(0, 25)
-        .map((item) => ({
-          score: item.score,
-          href: item.href,
-          domain: item.domain,
-          text: item.text,
-          ariaLabel: item.ariaLabel,
-          parentText: item.parentText,
-        }));
 
+    await expandResults(
+      page
+    );
+
+    body =
+      await page
+        .locator("body")
+        .innerText()
+        .catch(
+          () => ""
+        );
+
+    const parsed =
+      await parseAdvertisers(
+        page,
+        seed
+      );
+
+    /*
+     * IMPORTANT:
+     *
+     * DiscoveryResult currently has
+     * a domain-oriented schema.
+     *
+     * For V0.2 we store advertiser
+     * data inside raw_payload.
+     *
+     * After Mode 1 works, we'll update
+     * the permanent database schema.
+     */
+
+    const results:
+      DiscoveryResult[] =
+      parsed.advertisers.map(
+        (advertiser) => ({
+          provider:
+            "google_ads_transparency",
+
+          domain:
+            seed,
+
+          country,
+
+          source_url:
+            page.url(),
+
+          source_ref:
+            seed,
+
+          observed_at:
+            new Date()
+              .toISOString(),
+
+          raw_payload: {
+            mode:
+              "DOMAIN_SEARCH",
+
+            seed_domain:
+              seed,
+
+            format:
+              "TEXT",
+
+            advertiser_name:
+              advertiser.advertiser_name,
+
+            advertiser_id:
+              advertiser.advertiser_id,
+
+            text_ads_count:
+              advertiser.text_ads_count,
+
+            first_seen:
+              advertiser.first_seen,
+
+            last_seen:
+              advertiser.last_seen,
+
+            advertiser_type:
+              advertiser.advertiser_type,
+
+            expand:
+              advertiser.expand,
+
+            confidence:
+              advertiser.confidence,
+          },
+        })
+      );
+
+    /*
+     * If no advertiser parsed,
+     * DO NOT pretend success.
+     *
+     * Return diagnostics so we can
+     * map Google's real DOM precisely.
+     */
+
+    if (
+      results.length === 0
+    ) {
       return {
-        status: "manual_required",
+        status:
+          "manual_required",
 
         message:
-          "Search succeeded but no high-confidence advertiser/project domain was identified. " +
-          `strategy=${search.strategy}; ` +
+          "DOMAIN_SEARCH loaded successfully but advertiser parser found no advertiser records. " +
+          `seed=${seed}; ` +
           `url=${page.url()}; ` +
-          `candidates=${JSON.stringify(diagnostics)}`,
+          `diagnostics=${JSON.stringify(
+            parsed.diagnostics
+          )}`,
 
         results: [],
       };
     }
 
     return {
-      status: "completed",
+      status:
+        "completed",
 
       message:
-        `Search succeeded via ${search.strategy}. ` +
-        `Found ${results.length} high-confidence project domain(s).`,
+        `DOMAIN_SEARCH completed. ` +
+        `Found ${results.length} advertiser candidate(s) for ${seed}.`,
 
       results,
     };
   } catch (e) {
     return {
-      status: "failed",
+      status:
+        "failed",
 
       message:
         e instanceof Error
-          ? e.stack || e.message
+          ? e.stack ||
+            e.message
           : "Unknown browser error",
 
       results: [],
