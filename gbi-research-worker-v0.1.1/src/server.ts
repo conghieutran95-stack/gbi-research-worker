@@ -164,6 +164,31 @@ const crawlerLogMode =
     .toLowerCase();
 
 
+const compactLogAllowPatterns = [
+  /^\[AUTO_QUEUE\]/,
+  /^\[QUEUE\]/,
+  /^\[CRAWL\]/,
+  /^\[SUPABASE\]/,
+  /^\[GLOBAL_COOLDOWN\]/,
+  /^\[SPY ADS .*HTTP 429/i,
+  /^\[SPY ADS .*CIRCUIT_BREAKER/i,
+  /^\[SPY ADS .*RATE_LIMIT_STOP/i,
+  /^\[SPY ADS .*ERROR/i,
+  /^GBI Research Worker/,
+  /^Starting Container/,
+];
+
+function shouldKeepCompactLog(args: unknown[]): boolean {
+  if (crawlerLogMode === "verbose") return true;
+
+  const first = String(args?.[0] ?? "");
+
+  return compactLogAllowPatterns.some((pattern) =>
+    pattern.test(first)
+  );
+}
+
+
 const autoQueueEnabled =
   (process.env.AUTO_QUEUE_ENABLED || "false")
     .trim()
@@ -251,8 +276,20 @@ async function runGoogleAdsTransparencyCompact(
     `[CRAWL] START seed=${seed} country=${country || "US"}`
   );
 
-  console.log = () => undefined;
-  console.info = () => undefined;
+  const filteredLog = (...args: unknown[]) => {
+    if (shouldKeepCompactLog(args)) {
+      originalLog(...args);
+    }
+  };
+
+  const filteredInfo = (...args: unknown[]) => {
+    if (shouldKeepCompactLog(args)) {
+      originalInfo(...args);
+    }
+  };
+
+  console.log = filteredLog;
+  console.info = filteredInfo;
   console.debug = () => undefined;
 
   try {
@@ -1450,7 +1487,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.2.6",
+      "0.2.7",
 
     ingest_configured:
       Boolean(
@@ -1474,6 +1511,9 @@ app.get("/health", (_req, res) => {
       crawlerLogMode,
 
     compact_crawler_logs:
+      crawlerLogMode !== "verbose",
+
+    compact_log_filter:
       crawlerLogMode !== "verbose",
 
     auto_queue_enabled:
@@ -2367,7 +2407,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.2.6 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.2.7 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
