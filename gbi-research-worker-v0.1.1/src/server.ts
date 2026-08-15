@@ -193,6 +193,44 @@ const crawlTimeoutMs = Math.max(
   Number(process.env.CRAWL_TIMEOUT_MS || 240_000)
 );
 
+const captchaCooldownMs = Math.max(
+  300_000,
+  Number(process.env.CAPTCHA_COOLDOWN_MS || 3_600_000)
+);
+
+let globalCooldownUntil = 0;
+let globalCooldownReason: string | null = null;
+
+function isCaptchaError(value: unknown): boolean {
+  const text =
+    value instanceof Error
+      ? value.message
+      : String(value ?? "");
+
+  return /captcha|human verification|unusual traffic/i.test(text);
+}
+
+function activateGlobalCooldown(
+  reason: string,
+  durationMs = captchaCooldownMs
+): void {
+  globalCooldownUntil = Math.max(
+    globalCooldownUntil,
+    Date.now() + durationMs
+  );
+  globalCooldownReason = reason;
+
+  console.warn(
+    `[GLOBAL_COOLDOWN] START reason=${reason} until=${new Date(
+      globalCooldownUntil
+    ).toISOString()} duration_ms=${durationMs}`
+  );
+}
+
+function globalCooldownRemainingMs(): number {
+  return Math.max(0, globalCooldownUntil - Date.now());
+}
+
 let autoQueueBusy = false;
 let autoQueueTimer: NodeJS.Timeout | undefined;
 
@@ -1253,16 +1291,33 @@ async function processQueueRun(
             ? error.message
             : String(error);
 
-        console.error(
-          `[QUEUE] FAILED node=${node.node_type}:${node.node_key} error=${message}`
-        );
+        const captchaDetected =
+          isCaptchaError(error) ||
+          isCaptchaError(message);
+
+        if (captchaDetected) {
+          activateGlobalCooldown(
+            `captcha:${node.node_key}`,
+            captchaCooldownMs
+          );
+
+          console.warn(
+            `[QUEUE] CAPTCHA node=${node.node_key} retry_after_ms=${captchaCooldownMs}`
+          );
+        } else {
+          console.error(
+            `[QUEUE] FAILED node=${node.node_type}:${node.node_key} error=${message}`
+          );
+        }
 
         try {
           await finishDomainQueueNodeProtected(
             node.id,
             "failed",
             message,
-            undefined,
+            captchaDetected
+              ? Math.ceil(captchaCooldownMs / 1000)
+              : undefined,
             86_400,
             4
           );
@@ -1282,11 +1337,16 @@ async function processQueueRun(
           node_type: node.node_type,
           node_key: node.node_key,
           depth: node.depth,
-          status: "failed",
+          status: captchaDetected ? "retry" : "failed",
           discovered_domains: 0,
           result_count: 0,
           message,
         });
+
+        // Do not continue processing more claimed nodes after CAPTCHA.
+        if (captchaDetected) {
+          break;
+        }
       }
     }
 
@@ -1315,7 +1375,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.2.4",
+      "0.2.5",
 
     ingest_configured:
       Boolean(
@@ -1370,6 +1430,21 @@ app.get("/health", (_req, res) => {
 
     crawl_timeout_ms:
       crawlTimeoutMs,
+
+    captcha_protection:
+      true,
+
+    captcha_cooldown_ms:
+      captchaCooldownMs,
+
+    global_cooldown_active:
+      globalCooldownRemainingMs() > 0,
+
+    global_cooldown_remaining_ms:
+      globalCooldownRemainingMs(),
+
+    global_cooldown_reason:
+      globalCooldownReason,
 
     supabase_configured:
       Boolean(
@@ -1818,6 +1893,15 @@ app.post(
 async function runAutoQueueTick(): Promise<void> {
   if (!autoQueueEnabled) return;
 
+  const cooldownRemaining = globalCooldownRemainingMs();
+
+  if (cooldownRemaining > 0) {
+    console.log(
+      `[AUTO_QUEUE] SKIP reason=global_cooldown remaining_ms=${cooldownRemaining} cooldown_reason=${globalCooldownReason || "unknown"}`
+    );
+    return;
+  }
+
   if (autoQueueBusy) {
     console.log("[AUTO_QUEUE] SKIP reason=busy");
     return;
@@ -2208,7 +2292,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.2.4 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.2.5 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
