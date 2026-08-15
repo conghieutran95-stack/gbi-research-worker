@@ -36,6 +36,36 @@ const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
 const jobs = new Map<string, DiscoveryJob>();
 
+type QueueRunNodeResult = {
+  queue_id: string;
+  node_type: string;
+  node_key: string;
+  depth: number;
+  status: "done" | "failed" | "skip";
+  discovered_domains: number;
+  result_count: number;
+  next_cursor?: string;
+  message?: string;
+};
+
+type QueueRun = {
+  id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+  country: string;
+  requested_limit: number;
+  max_depth: number;
+  claimed_nodes: number;
+  processed_nodes: number;
+  discovered_domains: number;
+  results: QueueRunNodeResult[];
+  message?: string;
+};
+
+const queueRuns = new Map<string, QueueRun>();
+
 /* =========================================================
    AUTH
 ========================================================= */
@@ -588,6 +618,394 @@ function buildAdvertiserOcrRows(
   });
 }
 
+
+type ClaimedQueueNode = {
+  id: string;
+  node_type: string;
+  node_key: string;
+  depth: number;
+  priority: number;
+  parent_type?: string | null;
+  parent_key?: string | null;
+};
+
+function supabaseHeaders(): Record<string, string> {
+  if (!supabaseServiceRoleKey) {
+    throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing");
+  }
+
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "application/json",
+    apikey: supabaseServiceRoleKey,
+  };
+
+  if (supabaseServiceRoleKey.startsWith("eyJ")) {
+    headers.authorization = `Bearer ${supabaseServiceRoleKey}`;
+  }
+
+  return headers;
+}
+
+async function callSupabaseRpc(
+  functionName: string,
+  payload: Record<string, unknown>,
+  timeoutMs = 30_000
+): Promise<any> {
+  if (!supabaseUrl) {
+    throw new Error("SUPABASE_URL is missing");
+  }
+
+  const rpcUrl =
+    `${supabaseUrl}/rest/v1/rpc/${functionName}`;
+
+  console.log(`[SUPABASE] RPC ${functionName}`);
+
+  const response = await fetch(rpcUrl, {
+    method: "POST",
+    headers: supabaseHeaders(),
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Supabase RPC ${functionName} HTTP ${response.status}: ${text.slice(0, 1200)}`
+    );
+  }
+
+  if (!text.trim()) return null;
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+async function claimDomainQueueNodes(
+  limit: number,
+  maxDepth: number
+): Promise<ClaimedQueueNode[]> {
+  const data = await callSupabaseRpc(
+    "spy_claim_domain_expansion_queue",
+    {
+      p_limit: limit,
+      p_max_depth: maxDepth,
+    }
+  );
+
+  return Array.isArray(data)
+    ? data.map((item: any) => ({
+        id: String(item.id),
+        node_type: String(item.node_type),
+        node_key: String(item.node_key),
+        depth: Number(item.depth || 0),
+        priority: Number(item.priority || 0),
+        parent_type:
+          item.parent_type == null
+            ? null
+            : String(item.parent_type),
+        parent_key:
+          item.parent_key == null
+            ? null
+            : String(item.parent_key),
+      }))
+    : [];
+}
+
+async function finishDomainQueueNode(
+  id: string,
+  status: "done" | "failed" | "skip"
+): Promise<void> {
+  await callSupabaseRpc(
+    "spy_finish_expansion_queue",
+    {
+      p_id: id,
+      p_status: status,
+    }
+  );
+}
+
+function extractNextCursor(
+  workerOutput: any
+): string | undefined {
+  if (
+    typeof workerOutput?.next_cursor === "string" &&
+    workerOutput.next_cursor.trim()
+  ) {
+    return workerOutput.next_cursor.trim();
+  }
+
+  const results = Array.isArray(workerOutput?.results)
+    ? workerOutput.results
+    : [];
+
+  for (const result of results) {
+    const raw = getRawPayload(result);
+
+    if (
+      typeof raw?.next_cursor === "string" &&
+      raw.next_cursor.trim()
+    ) {
+      return raw.next_cursor.trim();
+    }
+  }
+
+  return undefined;
+}
+
+function buildQueueDiscoveryRows(
+  workerOutput: any
+): Array<Record<string, unknown>> {
+  const results = Array.isArray(workerOutput?.results)
+    ? workerOutput.results
+    : [];
+
+  const rows: Array<Record<string, unknown>> = [];
+
+  for (const result of results) {
+    const raw = getRawPayload(result);
+
+    const domain = normalizeDomain(
+      result?.domain ??
+        raw?.discovered_domain ??
+        raw?.domain
+    );
+
+    if (!domain) continue;
+
+    const advertisers = Array.isArray(raw?.advertisers)
+      ? raw.advertisers
+      : [];
+
+    const advertiserIds = Array.isArray(raw?.advertiser_ids)
+      ? raw.advertiser_ids
+      : [];
+
+    const candidates: Array<{
+      advertiser_id?: string;
+      advertiser_name?: string;
+    }> = [];
+
+    for (const advertiser of advertisers) {
+      candidates.push({
+        advertiser_id:
+          typeof advertiser?.advertiser_id === "string"
+            ? advertiser.advertiser_id
+            : undefined,
+        advertiser_name:
+          typeof advertiser?.advertiser_name === "string"
+            ? advertiser.advertiser_name
+            : undefined,
+      });
+    }
+
+    if (candidates.length === 0) {
+      const fallbackId =
+        typeof raw?.advertiser_id === "string"
+          ? raw.advertiser_id
+          : typeof advertiserIds[0] === "string"
+            ? advertiserIds[0]
+            : undefined;
+
+      candidates.push({
+        advertiser_id: fallbackId,
+        advertiser_name:
+          typeof raw?.advertiser_name === "string"
+            ? raw.advertiser_name
+            : undefined,
+      });
+    }
+
+    for (const advertiser of candidates) {
+      if (!advertiser.advertiser_id) continue;
+
+      rows.push({
+        domain,
+        advertiser_id: advertiser.advertiser_id,
+        advertiser_name: advertiser.advertiser_name,
+        first_seen:
+          raw?.ads_first_seen ??
+          raw?.first_seen ??
+          result?.first_seen ??
+          undefined,
+        last_seen:
+          raw?.ads_last_seen ??
+          raw?.last_seen ??
+          result?.last_seen ??
+          undefined,
+        creative_count:
+          raw?.creative_count ??
+          result?.creative_count ??
+          1,
+        confidence:
+          raw?.confidence ??
+          result?.confidence ??
+          undefined,
+      });
+    }
+  }
+
+  return rows;
+}
+
+async function ingestQueueDomainWorkerResults(
+  node: ClaimedQueueNode,
+  workerOutput: any
+): Promise<any> {
+  const rows = buildQueueDiscoveryRows(workerOutput);
+  const nextCursor = extractNextCursor(workerOutput);
+
+  return callSupabaseRpc(
+    "spy_ingest_queue_domain_results",
+    {
+      p_queue_id: node.id,
+      p_seed: node.node_key,
+      p_depth: node.depth,
+      p_results: rows,
+      p_next_cursor: nextCursor ?? null,
+    },
+    60_000
+  );
+}
+
+async function processQueueRun(
+  run: QueueRun
+): Promise<void> {
+  run.status = "running";
+  run.started_at = new Date().toISOString();
+
+  try {
+    const nodes = await claimDomainQueueNodes(
+      run.requested_limit,
+      run.max_depth
+    );
+
+    run.claimed_nodes = nodes.length;
+
+    if (nodes.length === 0) {
+      run.status = "completed";
+      run.message =
+        "No pending domain/domain_cursor nodes available within max_depth.";
+      return;
+    }
+
+    for (const node of nodes) {
+      try {
+        console.log(
+          `[QUEUE] Processing ${node.node_type}:${node.node_key} depth=${node.depth}`
+        );
+
+        const out = await runGoogleAdsTransparency(
+          node.node_key,
+          run.country
+        );
+
+        const rows = buildQueueDiscoveryRows(out);
+        const uniqueDomains = new Set(
+          rows
+            .map((row) => normalizeDomain(row.domain))
+            .filter(Boolean)
+        );
+
+        const nextCursor = extractNextCursor(out);
+
+        await ingestQueueDomainWorkerResults(
+          node,
+          out
+        );
+
+        const workerStatus =
+          String(out?.status || "").toLowerCase();
+
+        const finalStatus:
+          | "done"
+          | "failed"
+          | "skip" =
+          workerStatus === "failed"
+            ? "failed"
+            : "done";
+
+        await finishDomainQueueNode(
+          node.id,
+          finalStatus
+        );
+
+        run.processed_nodes += 1;
+        run.discovered_domains +=
+          uniqueDomains.size;
+
+        run.results.push({
+          queue_id: node.id,
+          node_type: node.node_type,
+          node_key: node.node_key,
+          depth: node.depth,
+          status: finalStatus,
+          discovered_domains:
+            uniqueDomains.size,
+          result_count:
+            Array.isArray(out?.results)
+              ? out.results.length
+              : 0,
+          next_cursor: nextCursor,
+          message:
+            typeof out?.message === "string"
+              ? out.message
+              : undefined,
+        });
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : String(error);
+
+        console.error(
+          `[QUEUE] Node failed ${node.node_type}:${node.node_key}`,
+          error
+        );
+
+        try {
+          await finishDomainQueueNode(
+            node.id,
+            "failed"
+          );
+        } catch (finishError) {
+          console.error(
+            "[QUEUE] Failed to mark queue node failed",
+            finishError
+          );
+        }
+
+        run.processed_nodes += 1;
+        run.results.push({
+          queue_id: node.id,
+          node_type: node.node_type,
+          node_key: node.node_key,
+          depth: node.depth,
+          status: "failed",
+          discovered_domains: 0,
+          result_count: 0,
+          message,
+        });
+      }
+    }
+
+    run.status = "completed";
+  } catch (error) {
+    run.status = "failed";
+    run.message =
+      error instanceof Error
+        ? error.message
+        : String(error);
+  } finally {
+    run.finished_at =
+      new Date().toISOString();
+  }
+}
+
 /* =========================================================
    HEALTH
 ========================================================= */
@@ -600,7 +1018,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.1.8",
+      "0.1.9",
 
     ingest_configured:
       Boolean(
@@ -613,6 +1031,12 @@ app.get("/health", (_req, res) => {
 
     csv_importer:
       true,
+
+    queue_runner:
+      true,
+
+    queue_runner_mode:
+      "domain_only_v1",
 
     supabase_configured:
       Boolean(
@@ -1056,6 +1480,125 @@ app.post(
   }
 );
 
+
+/* =========================================================
+   SPY ADS QUEUE RUNNER
+========================================================= */
+
+app.post(
+  "/spy/run-queue",
+  auth,
+  (req, res) => {
+    const schema = z.object({
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(3)
+        .optional(),
+
+      maxDepth: z
+        .number()
+        .int()
+        .min(0)
+        .max(3)
+        .optional(),
+
+      country: z
+        .string()
+        .min(2)
+        .max(20)
+        .optional(),
+    });
+
+    const parsed = schema.safeParse(
+      req.body ?? {}
+    );
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        ok: false,
+        error: parsed.error.flatten(),
+      });
+    }
+
+    const id = crypto.randomUUID();
+
+    const run: QueueRun = {
+      id,
+      status: "queued",
+      created_at:
+        new Date().toISOString(),
+      country:
+        parsed.data.country ?? "US",
+      requested_limit:
+        parsed.data.limit ?? 1,
+      max_depth:
+        parsed.data.maxDepth ?? 3,
+      claimed_nodes: 0,
+      processed_nodes: 0,
+      discovered_domains: 0,
+      results: [],
+    };
+
+    queueRuns.set(id, run);
+
+    setImmediate(async () => {
+      await processQueueRun(run);
+    });
+
+    return res.status(202).json({
+      ok: true,
+      id,
+      status: run.status,
+      limit: run.requested_limit,
+      maxDepth: run.max_depth,
+      country: run.country,
+    });
+  }
+);
+
+app.get(
+  "/spy/run-queue/:id",
+  auth,
+  (req, res) => {
+    const run = queueRuns.get(
+      req.params.id
+    );
+
+    if (!run) {
+      return res.status(404).json({
+        ok: false,
+        error: "Queue run not found",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      ...run,
+    });
+  }
+);
+
+app.get(
+  "/spy/run-queue",
+  auth,
+  (_req, res) => {
+    const runs = [
+      ...queueRuns.values(),
+    ].sort((a, b) =>
+      b.created_at.localeCompare(
+        a.created_at
+      )
+    );
+
+    return res.json({
+      ok: true,
+      runs,
+    });
+  }
+);
+
 /* =========================================================
    IMAGE -> DOMAIN
 ========================================================= */
@@ -1255,7 +1798,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.1.8 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.1.9 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
