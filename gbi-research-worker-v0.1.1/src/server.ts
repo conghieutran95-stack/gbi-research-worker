@@ -21,7 +21,17 @@ const port = Number(process.env.PORT || 3000);
 const apiKey = process.env.WORKER_API_KEY || "";
 const ingestUrl = process.env.GBI_RESEARCH_INGEST_URL || "";
 const ingestToken = process.env.SPY_ADS_INGEST_TOKEN || "";
-const supabaseUrl = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+function normalizeSupabaseBaseUrl(value: string): string {
+  return value
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/rest\/v1$/i, "")
+    .replace(/\/+$/, "");
+}
+
+const supabaseUrl = normalizeSupabaseBaseUrl(
+  process.env.SUPABASE_URL || ""
+);
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
 const jobs = new Map<string, DiscoveryJob>();
@@ -423,8 +433,15 @@ async function ingestDomainCsvToSupabase(
     headers.authorization = `Bearer ${supabaseServiceRoleKey}`;
   }
 
+  const rpcUrl =
+    `${supabaseUrl}/rest/v1/rpc/spy_ingest_domain_csv`;
+
+  console.log(
+    `[SUPABASE] RPC ${rpcUrl}`
+  );
+
   const response = await fetch(
-    `${supabaseUrl}/rest/v1/rpc/spy_ingest_domain_csv`,
+    rpcUrl,
     {
       method: "POST",
       headers,
@@ -468,7 +485,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.1.6",
+      "0.1.7",
 
     ingest_configured:
       Boolean(
@@ -487,6 +504,9 @@ app.get("/health", (_req, res) => {
         supabaseUrl &&
           supabaseServiceRoleKey
       ),
+
+    supabase_base_url:
+      supabaseUrl || null,
 
     time:
       new Date().toISOString(),
@@ -1072,7 +1092,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.1.6 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.1.7 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
