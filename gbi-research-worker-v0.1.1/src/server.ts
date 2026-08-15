@@ -163,6 +163,34 @@ const crawlerLogMode =
     .trim()
     .toLowerCase();
 
+
+const autoQueueEnabled =
+  (process.env.AUTO_QUEUE_ENABLED || "false")
+    .trim()
+    .toLowerCase() === "true";
+
+const autoQueueIntervalMs = Math.max(
+  60_000,
+  Number(process.env.AUTO_QUEUE_INTERVAL_MS || 300_000)
+);
+
+const autoQueueCountry =
+  (process.env.AUTO_QUEUE_COUNTRY || "US")
+    .trim() || "US";
+
+const autoQueueMaxDepth = Math.max(
+  0,
+  Math.min(
+    3,
+    Number(process.env.AUTO_QUEUE_MAX_DEPTH || 3)
+  )
+);
+
+const autoQueueLimit = 1;
+
+let autoQueueBusy = false;
+let autoQueueTimer: NodeJS.Timeout | undefined;
+
 async function runGoogleAdsTransparencyCompact(
   seed: string,
   country?: string
@@ -1107,7 +1135,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.2.0",
+      "0.2.1",
 
     ingest_configured:
       Boolean(
@@ -1132,6 +1160,24 @@ app.get("/health", (_req, res) => {
 
     compact_crawler_logs:
       crawlerLogMode !== "verbose",
+
+    auto_queue_enabled:
+      autoQueueEnabled,
+
+    auto_queue_interval_ms:
+      autoQueueIntervalMs,
+
+    auto_queue_limit:
+      autoQueueLimit,
+
+    auto_queue_max_depth:
+      autoQueueMaxDepth,
+
+    auto_queue_country:
+      autoQueueCountry,
+
+    auto_queue_busy:
+      autoQueueBusy,
 
     supabase_configured:
       Boolean(
@@ -1576,6 +1622,83 @@ app.post(
 );
 
 
+
+async function runAutoQueueTick(): Promise<void> {
+  if (!autoQueueEnabled) return;
+
+  if (autoQueueBusy) {
+    console.log("[AUTO_QUEUE] SKIP reason=busy");
+    return;
+  }
+
+  autoQueueBusy = true;
+
+  const id = crypto.randomUUID();
+
+  const run: QueueRun = {
+    id,
+    status: "queued",
+    created_at: new Date().toISOString(),
+    country: autoQueueCountry,
+    requested_limit: autoQueueLimit,
+    max_depth: autoQueueMaxDepth,
+    claimed_nodes: 0,
+    processed_nodes: 0,
+    discovered_domains: 0,
+    results: [],
+  };
+
+  queueRuns.set(id, run);
+
+  try {
+    console.log(
+      `[AUTO_QUEUE] START id=${id} limit=${autoQueueLimit} max_depth=${autoQueueMaxDepth} country=${autoQueueCountry}`
+    );
+
+    await processQueueRun(run);
+
+    console.log(
+      [
+        "[AUTO_QUEUE] DONE",
+        `id=${id}`,
+        `status=${run.status}`,
+        `claimed=${run.claimed_nodes}`,
+        `processed=${run.processed_nodes}`,
+        `domains=${run.discovered_domains}`,
+      ].join(" ")
+    );
+  } catch (error) {
+    console.error(
+      `[AUTO_QUEUE] ERROR id=${id} error=${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  } finally {
+    autoQueueBusy = false;
+  }
+}
+
+function startAutoQueueScheduler(): void {
+  if (!autoQueueEnabled) {
+    console.log("[AUTO_QUEUE] disabled");
+    return;
+  }
+
+  console.log(
+    `[AUTO_QUEUE] enabled interval_ms=${autoQueueIntervalMs} limit=${autoQueueLimit} max_depth=${autoQueueMaxDepth} country=${autoQueueCountry}`
+  );
+
+  setTimeout(() => {
+    void runAutoQueueTick();
+  }, 15_000);
+
+  autoQueueTimer = setInterval(() => {
+    void runAutoQueueTick();
+  }, autoQueueIntervalMs);
+
+  autoQueueTimer.unref?.();
+}
+
 /* =========================================================
    SPY ADS QUEUE RUNNER
 ========================================================= */
@@ -1893,13 +2016,15 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.2.0 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.2.1 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
         supabaseUrl &&
           supabaseServiceRoleKey
-      )}`
+      )} | auto-queue=${autoQueueEnabled} | crawler-logs=${crawlerLogMode}`
     );
+
+    startAutoQueueScheduler();
   }
 );
