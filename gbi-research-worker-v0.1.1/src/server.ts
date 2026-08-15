@@ -223,6 +223,17 @@ const captchaCooldownMs = Math.max(
   Number(process.env.CAPTCHA_COOLDOWN_MS || 3_600_000)
 );
 
+
+const captchaManualRequired =
+  (process.env.CAPTCHA_MANUAL_REQUIRED || "true")
+    .trim()
+    .toLowerCase() === "true";
+
+const sessionCooldownMs = Math.max(
+  300_000,
+  Number(process.env.SESSION_COOLDOWN_MS || 3_600_000)
+);
+
 let globalCooldownUntil = 0;
 let globalCooldownReason: string | null = null;
 
@@ -269,6 +280,7 @@ async function runGoogleAdsTransparencyCompact(
 
   const originalLog = console.log;
   const originalInfo = console.info;
+  const originalWarn = console.warn;
   const originalDebug = console.debug;
   const started = Date.now();
 
@@ -288,8 +300,15 @@ async function runGoogleAdsTransparencyCompact(
     }
   };
 
+  const filteredWarn = (...args: unknown[]) => {
+    if (shouldKeepCompactLog(args)) {
+      originalWarn(...args);
+    }
+  };
+
   console.log = filteredLog;
   console.info = filteredInfo;
+  console.warn = filteredWarn;
   console.debug = () => undefined;
 
   try {
@@ -357,6 +376,7 @@ async function runGoogleAdsTransparencyCompact(
   } finally {
     console.log = originalLog;
     console.info = originalInfo;
+    console.warn = originalWarn;
     console.debug = originalDebug;
   }
 }
@@ -1250,15 +1270,19 @@ async function processQueueRun(
 
           await finishDomainQueueNodeProtected(
             node.id,
-            "failed",
+            captchaManualRequired ? "blocked" : "failed",
             captchaMessage,
-            Math.ceil(captchaCooldownMs / 1000),
+            captchaManualRequired
+              ? undefined
+              : Math.ceil(captchaCooldownMs / 1000),
             86_400,
             4
           );
 
           console.warn(
-            `[QUEUE] CAPTCHA node=${node.node_key} cooldown_ms=${captchaCooldownMs}`
+            `[QUEUE] CAPTCHA node=${node.node_key} cooldown_ms=${captchaCooldownMs} action=${
+              captchaManualRequired ? "manual_required" : "retry"
+            }`
           );
 
           run.processed_nodes += 1;
@@ -1268,7 +1292,7 @@ async function processQueueRun(
             node_type: node.node_type,
             node_key: node.node_key,
             depth: node.depth,
-            status: "retry",
+            status: captchaManualRequired ? "skip" : "retry",
             discovered_domains: 0,
             result_count: resultCount,
             next_cursor: nextCursor,
@@ -1425,9 +1449,11 @@ async function processQueueRun(
         try {
           await finishDomainQueueNodeProtected(
             node.id,
-            "failed",
+            captchaDetected && captchaManualRequired
+              ? "blocked"
+              : "failed",
             message,
-            captchaDetected
+            captchaDetected && !captchaManualRequired
               ? Math.ceil(captchaCooldownMs / 1000)
               : undefined,
             86_400,
@@ -1449,7 +1475,12 @@ async function processQueueRun(
           node_type: node.node_type,
           node_key: node.node_key,
           depth: node.depth,
-          status: captchaDetected ? "retry" : "failed",
+          status:
+            captchaDetected && captchaManualRequired
+              ? "skip"
+              : captchaDetected
+                ? "retry"
+                : "failed",
           discovered_domains: 0,
           result_count: 0,
           message,
@@ -1487,7 +1518,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.2.7",
+      "0.2.8",
 
     ingest_configured:
       Boolean(
@@ -1551,6 +1582,12 @@ app.get("/health", (_req, res) => {
 
     captcha_cooldown_ms:
       captchaCooldownMs,
+
+    captcha_manual_required:
+      captchaManualRequired,
+
+    session_cooldown_ms:
+      sessionCooldownMs,
 
     global_cooldown_active:
       globalCooldownRemainingMs() > 0,
@@ -2407,7 +2444,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.2.7 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.2.8 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
