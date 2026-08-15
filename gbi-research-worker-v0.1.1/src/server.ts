@@ -21,6 +21,8 @@ const port = Number(process.env.PORT || 3000);
 const apiKey = process.env.WORKER_API_KEY || "";
 const ingestUrl = process.env.GBI_RESEARCH_INGEST_URL || "";
 const ingestToken = process.env.SPY_ADS_INGEST_TOKEN || "";
+const supabaseUrl = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
 const jobs = new Map<string, DiscoveryJob>();
 
@@ -396,6 +398,65 @@ async function ingestSpyAds(
 }
 
 /* =========================================================
+   SUPABASE RPC
+========================================================= */
+
+async function ingestDomainCsvToSupabase(
+  seed: string,
+  rows: unknown[]
+): Promise<any> {
+  if (!supabaseUrl || !supabaseServiceRoleKey) {
+    throw new Error(
+      "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing"
+    );
+  }
+
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "application/json",
+    apikey: supabaseServiceRoleKey,
+  };
+
+  // Legacy service_role keys are JWTs and may also be used as Bearer tokens.
+  // New sb_secret_* keys should be sent on the apikey header.
+  if (supabaseServiceRoleKey.startsWith("eyJ")) {
+    headers.authorization = `Bearer ${supabaseServiceRoleKey}`;
+  }
+
+  const response = await fetch(
+    `${supabaseUrl}/rest/v1/rpc/spy_ingest_domain_csv`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        p_seed: seed,
+        p_rows: rows,
+        p_source: "transparency_csv",
+      }),
+      signal: AbortSignal.timeout(30_000),
+    }
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Supabase RPC HTTP ${response.status}: ${text.slice(0, 1200)}`
+    );
+  }
+
+  if (!text.trim()) {
+    return { ok: true };
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { ok: true, raw: text };
+  }
+}
+
+/* =========================================================
    HEALTH
 ========================================================= */
 
@@ -407,7 +468,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.1.5",
+      "0.1.6",
 
     ingest_configured:
       Boolean(
@@ -420,6 +481,12 @@ app.get("/health", (_req, res) => {
 
     csv_importer:
       true,
+
+    supabase_configured:
+      Boolean(
+        supabaseUrl &&
+          supabaseServiceRoleKey
+      ),
 
     time:
       new Date().toISOString(),
@@ -750,6 +817,25 @@ app.post(
         };
       }
 
+      let databaseIngest: any = undefined;
+
+      if (parsed.data.searchType === "domain") {
+        const seed = (parsed.data.seed || "").trim();
+
+        if (!seed) {
+          return res.status(400).json({
+            ok: false,
+            error: "seed is required when searchType=domain",
+          });
+        }
+
+        databaseIngest =
+          await ingestDomainCsvToSupabase(
+            seed,
+            imported.rows
+          );
+      }
+
       return res.json({
         ok: true,
         searchType:
@@ -768,6 +854,7 @@ app.post(
         imageUrls: imported.imageUrls,
         rows: imported.rows,
         imageResolution,
+        databaseIngest,
       });
     } catch (error) {
       console.error(
@@ -985,10 +1072,13 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.1.5 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.1.6 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
-      )} | image-resolver=true | csv-importer=true`
+      )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
+        supabaseUrl &&
+          supabaseServiceRoleKey
+      )}`
     );
   }
 );
