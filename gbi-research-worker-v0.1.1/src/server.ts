@@ -992,6 +992,37 @@ function extractNextCursor(
   return undefined;
 }
 
+
+function extractCaptchaDetected(
+  workerOutput: any
+): boolean {
+  const texts: string[] = [];
+
+  if (workerOutput?.message) {
+    texts.push(String(workerOutput.message));
+  }
+
+  if (workerOutput?.error) {
+    texts.push(String(workerOutput.error));
+  }
+
+  if (Array.isArray(workerOutput?.results)) {
+    for (const result of workerOutput.results) {
+      const raw = getRawPayload(result);
+
+      if (result?.message) texts.push(String(result.message));
+      if (result?.error) texts.push(String(result.error));
+      if (raw?.message) texts.push(String(raw.message));
+      if (raw?.error) texts.push(String(raw.error));
+      if (raw?.final_status) texts.push(String(raw.final_status));
+    }
+  }
+
+  const joined = texts.join(" | ");
+
+  return /captcha|human verification|unusual traffic/i.test(joined);
+}
+
 function buildQueueDiscoveryRows(
   workerOutput: any
 ): Array<Record<string, unknown>> {
@@ -1161,10 +1192,54 @@ async function processQueueRun(
           retryAfterSeconds,
         } = extractQueueRateLimitInfo(out);
 
+        const captchaDetected =
+          extractCaptchaDetected(out);
+
         const resultCount =
           Array.isArray(out?.results)
             ? out.results.length
             : 0;
+
+        if (captchaDetected) {
+          const captchaMessage =
+            typeof out?.message === "string"
+              ? out.message
+              : "Human verification/CAPTCHA detected";
+
+          activateGlobalCooldown(
+            `captcha:${node.node_key}`,
+            captchaCooldownMs
+          );
+
+          await finishDomainQueueNodeProtected(
+            node.id,
+            "failed",
+            captchaMessage,
+            Math.ceil(captchaCooldownMs / 1000),
+            86_400,
+            4
+          );
+
+          console.warn(
+            `[QUEUE] CAPTCHA node=${node.node_key} cooldown_ms=${captchaCooldownMs}`
+          );
+
+          run.processed_nodes += 1;
+
+          run.results.push({
+            queue_id: node.id,
+            node_type: node.node_type,
+            node_key: node.node_key,
+            depth: node.depth,
+            status: "retry",
+            discovered_domains: 0,
+            result_count: resultCount,
+            next_cursor: nextCursor,
+            message: captchaMessage,
+          });
+
+          break;
+        }
 
         /*
          * A 429 seen during a crawl does NOT automatically mean
@@ -1375,7 +1450,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.2.5",
+      "0.2.6",
 
     ingest_configured:
       Boolean(
@@ -2292,7 +2367,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.2.5 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.2.6 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
