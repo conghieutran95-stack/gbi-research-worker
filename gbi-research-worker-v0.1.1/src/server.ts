@@ -473,6 +473,121 @@ async function ingestDomainCsvToSupabase(
   }
 }
 
+
+async function ingestAdvertiserOcrToSupabase(
+  seedAdvertiser: string,
+  rows: unknown[]
+): Promise<any> {
+  if (!supabaseUrl || !supabaseServiceRoleKey) {
+    throw new Error(
+      "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing"
+    );
+  }
+
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    accept: "application/json",
+    apikey: supabaseServiceRoleKey,
+  };
+
+  if (supabaseServiceRoleKey.startsWith("eyJ")) {
+    headers.authorization = `Bearer ${supabaseServiceRoleKey}`;
+  }
+
+  const rpcUrl =
+    `${supabaseUrl}/rest/v1/rpc/spy_ingest_advertiser_ocr`;
+
+  console.log(
+    `[SUPABASE] OCR RPC ${rpcUrl} | rows=${rows.length}`
+  );
+
+  const response = await fetch(
+    rpcUrl,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        p_seed_advertiser: seedAdvertiser,
+        p_rows: rows,
+        p_source: "transparency_csv_ocr",
+      }),
+      signal: AbortSignal.timeout(60_000),
+    }
+  );
+
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `Supabase OCR RPC HTTP ${response.status}: ${text.slice(0, 1200)}`
+    );
+  }
+
+  if (!text.trim()) {
+    return { ok: true };
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {
+      ok: true,
+      raw: text,
+    };
+  }
+}
+
+function buildAdvertiserOcrRows(
+  importedRows: any[],
+  resolutionResults: any[]
+): any[] {
+  const resolutionByImage = new Map<string, any>();
+
+  for (const result of resolutionResults) {
+    const imageUrl =
+      typeof result?.imageUrl === "string"
+        ? result.imageUrl.trim()
+        : "";
+
+    if (imageUrl) {
+      resolutionByImage.set(imageUrl, result);
+    }
+  }
+
+  return importedRows.map((row: any) => {
+    const imageUrl =
+      typeof row?.imageUrl === "string"
+        ? row.imageUrl.trim()
+        : "";
+
+    const resolution =
+      imageUrl
+        ? resolutionByImage.get(imageUrl)
+        : undefined;
+
+    const resolvedDomain =
+      normalizeDomain(
+        resolution?.primaryDomain ??
+        resolution?.domain ??
+        (Array.isArray(resolution?.domains)
+          ? resolution.domains[0]
+          : undefined)
+      );
+
+    return {
+      ...row,
+      resolvedDomain,
+      ocrText:
+        resolution?.ocrText ??
+        undefined,
+      confidence:
+        typeof resolution?.confidence === "number"
+          ? resolution.confidence
+          : undefined,
+    };
+  });
+}
+
 /* =========================================================
    HEALTH
 ========================================================= */
@@ -485,7 +600,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.1.7",
+      "0.1.8",
 
     ingest_configured:
       Boolean(
@@ -856,6 +971,36 @@ app.post(
           );
       }
 
+      if (
+        parsed.data.searchType === "advertiser" &&
+        parsed.data.resolveImages === true
+      ) {
+        const seedAdvertiser =
+          (parsed.data.seed || "").trim() ||
+          imported.advertisers[0]?.advertiserId ||
+          "unknown";
+
+        if (!imageResolution) {
+          return res.status(500).json({
+            ok: false,
+            error:
+              "Image resolution was requested but no resolution result was produced",
+          });
+        }
+
+        const enrichedRows =
+          buildAdvertiserOcrRows(
+            imported.rows as any[],
+            imageResolution.results as any[]
+          );
+
+        databaseIngest =
+          await ingestAdvertiserOcrToSupabase(
+            seedAdvertiser,
+            enrichedRows
+          );
+      }
+
       return res.json({
         ok: true,
         searchType:
@@ -874,6 +1019,24 @@ app.post(
         imageUrls: imported.imageUrls,
         rows: imported.rows,
         imageResolution,
+        resolvedDomains:
+          imageResolution
+            ? [
+                ...new Set(
+                  imageResolution.results
+                    .map((item: any) =>
+                      normalizeDomain(
+                        item?.primaryDomain ??
+                        item?.domain ??
+                        (Array.isArray(item?.domains)
+                          ? item.domains[0]
+                          : undefined)
+                      )
+                    )
+                    .filter(Boolean)
+                ),
+              ]
+            : [],
         databaseIngest,
       });
     } catch (error) {
@@ -1092,7 +1255,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.1.7 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.1.8 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
