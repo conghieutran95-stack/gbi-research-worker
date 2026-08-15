@@ -1123,14 +1123,34 @@ async function processQueueRun(
           retryAfterSeconds,
         } = extractQueueRateLimitInfo(out);
 
+        const resultCount =
+          Array.isArray(out?.results)
+            ? out.results.length
+            : 0;
+
+        /*
+         * A 429 seen during a crawl does NOT automatically mean
+         * the whole node failed. The crawler may back off/retry
+         * internally and still return status=completed with useful
+         * results. In that case we keep the ingested results and
+         * mark the node done.
+         *
+         * Retry only when the worker explicitly reports a
+         * rate-limited/retry state, or when 429 occurred and the
+         * crawl produced no usable results.
+         */
         const shouldRetry =
-          http429Count > 0 ||
           workerStatus === "rate_limited" ||
-          workerStatus === "retry";
+          workerStatus === "retry" ||
+          (
+            http429Count > 0 &&
+            resultCount === 0 &&
+            workerStatus !== "completed"
+          );
 
         if (shouldRetry) {
           const retryMessage =
-            `Rate limited: http429=${http429Count}; retry_after=${retryAfterSeconds}s`;
+            `Rate limited/incomplete: http429=${http429Count}; results=${resultCount}; retry_after=${retryAfterSeconds}s`;
 
           await finishDomainQueueNodeProtected(
             node.id,
@@ -1142,7 +1162,7 @@ async function processQueueRun(
           );
 
           console.log(
-            `[QUEUE] RETRY node=${node.node_key} http429=${http429Count} retry_after=${retryAfterSeconds}s`
+            `[QUEUE] RETRY node=${node.node_key} http429=${http429Count} results=${resultCount} retry_after=${retryAfterSeconds}s`
           );
 
           run.processed_nodes += 1;
@@ -1154,15 +1174,18 @@ async function processQueueRun(
             depth: node.depth,
             status: "retry",
             discovered_domains: 0,
-            result_count:
-              Array.isArray(out?.results)
-                ? out.results.length
-                : 0,
+            result_count: resultCount,
             next_cursor: nextCursor,
             message: retryMessage,
           });
 
           continue;
+        }
+
+        if (http429Count > 0 && workerStatus === "completed") {
+          console.log(
+            `[QUEUE] 429_RECOVERED node=${node.node_key} http429=${http429Count} results=${resultCount} domains=${uniqueDomains.size}`
+          );
         }
 
         const finalStatus:
@@ -1292,7 +1315,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.2.3",
+      "0.2.4",
 
     ingest_configured:
       Boolean(
@@ -2185,7 +2208,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.2.3 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.2.4 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
