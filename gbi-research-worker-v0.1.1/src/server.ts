@@ -153,6 +153,93 @@ function getRawPayload(result: any): any {
     : {};
 }
 
+
+/* =========================================================
+   LOW-LOG CRAWLER WRAPPER
+========================================================= */
+
+const crawlerLogMode =
+  (process.env.CRAWLER_LOG_MODE || "compact")
+    .trim()
+    .toLowerCase();
+
+async function runGoogleAdsTransparencyCompact(
+  seed: string,
+  country?: string
+): Promise<any> {
+  if (crawlerLogMode === "verbose") {
+    return runGoogleAdsTransparency(seed, country);
+  }
+
+  const originalLog = console.log;
+  const originalInfo = console.info;
+  const originalDebug = console.debug;
+  const started = Date.now();
+
+  originalLog(
+    `[CRAWL] START seed=${seed} country=${country || "US"}`
+  );
+
+  console.log = () => undefined;
+  console.info = () => undefined;
+  console.debug = () => undefined;
+
+  try {
+    const out =
+      await runGoogleAdsTransparency(seed, country);
+
+    const results =
+      Array.isArray(out?.results)
+        ? out.results
+        : [];
+
+    const uniqueDomains =
+      new Set(
+        results
+          .map((item: any) =>
+            normalizeDomain(
+              item?.domain ??
+                getRawPayload(item)?.discovered_domain ??
+                getRawPayload(item)?.domain
+            )
+          )
+          .filter(Boolean)
+      ).size;
+
+    const nextCursor =
+      typeof out?.next_cursor === "string"
+        ? out.next_cursor
+        : undefined;
+
+    originalLog(
+      [
+        "[CRAWL] DONE",
+        `seed=${seed}`,
+        `status=${String(out?.status || "unknown")}`,
+        `results=${results.length}`,
+        `unique_domains=${uniqueDomains}`,
+        `next_cursor=${nextCursor || "none"}`,
+        `duration_ms=${Date.now() - started}`,
+      ].join(" ")
+    );
+
+    return out;
+  } catch (error) {
+    console.error(
+      `[CRAWL] ERROR seed=${seed} error=${
+        error instanceof Error
+          ? error.message
+          : String(error)
+      }`
+    );
+    throw error;
+  } finally {
+    console.log = originalLog;
+    console.info = originalInfo;
+    console.debug = originalDebug;
+  }
+}
+
 /* =========================================================
    INGEST PAYLOAD
 ========================================================= */
@@ -899,7 +986,7 @@ async function processQueueRun(
           `[QUEUE] Processing ${node.node_type}:${node.node_key} depth=${node.depth}`
         );
 
-        const out = await runGoogleAdsTransparency(
+        const out = await runGoogleAdsTransparencyCompact(
           node.node_key,
           run.country
         );
@@ -963,8 +1050,7 @@ async function processQueueRun(
             : String(error);
 
         console.error(
-          `[QUEUE] Node failed ${node.node_type}:${node.node_key}`,
-          error
+          `[QUEUE] FAILED node=${node.node_type}:${node.node_key} error=${message}`
         );
 
         try {
@@ -974,8 +1060,11 @@ async function processQueueRun(
           );
         } catch (finishError) {
           console.error(
-            "[QUEUE] Failed to mark queue node failed",
-            finishError
+            `[QUEUE] FAILED_TO_MARK queue_id=${node.id} error=${
+              finishError instanceof Error
+                ? finishError.message
+                : String(finishError)
+            }`
           );
         }
 
@@ -1018,7 +1107,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.1.9",
+      "0.2.0",
 
     ingest_configured:
       Boolean(
@@ -1037,6 +1126,12 @@ app.get("/health", (_req, res) => {
 
     queue_runner_mode:
       "domain_only_v1",
+
+    crawler_log_mode:
+      crawlerLogMode,
+
+    compact_crawler_logs:
+      crawlerLogMode !== "verbose",
 
     supabase_configured:
       Boolean(
@@ -1127,7 +1222,7 @@ app.post(
 
       try {
         const out =
-          await runGoogleAdsTransparency(
+          await runGoogleAdsTransparencyCompact(
             job.seed,
             job.country
           );
@@ -1798,7 +1893,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.1.9 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.2.0 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
