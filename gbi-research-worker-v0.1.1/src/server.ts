@@ -188,6 +188,11 @@ const autoQueueMaxDepth = Math.max(
 
 const autoQueueLimit = 1;
 
+const crawlTimeoutMs = Math.max(
+  60_000,
+  Number(process.env.CRAWL_TIMEOUT_MS || 240_000)
+);
+
 let autoQueueBusy = false;
 let autoQueueTimer: NodeJS.Timeout | undefined;
 
@@ -213,12 +218,25 @@ async function runGoogleAdsTransparencyCompact(
   console.debug = () => undefined;
 
   try {
-    const out =
-      await runGoogleAdsTransparency(seed, country);
+    const out = await Promise.race([
+      runGoogleAdsTransparency(seed, country),
+      new Promise((_, reject) => {
+        const timer = setTimeout(
+          () => reject(
+            new Error(
+              `CRAWL_TIMEOUT after ${crawlTimeoutMs}ms for seed=${seed}`
+            )
+          ),
+          crawlTimeoutMs
+        );
+
+        (timer as any).unref?.();
+      }),
+    ]);
 
     const results =
-      Array.isArray(out?.results)
-        ? out.results
+      Array.isArray((out as any)?.results)
+        ? (out as any).results
         : [];
 
     const uniqueDomains =
@@ -235,15 +253,15 @@ async function runGoogleAdsTransparencyCompact(
       ).size;
 
     const nextCursor =
-      typeof out?.next_cursor === "string"
-        ? out.next_cursor
+      typeof (out as any)?.next_cursor === "string"
+        ? (out as any).next_cursor
         : undefined;
 
     originalLog(
       [
         "[CRAWL] DONE",
         `seed=${seed}`,
-        `status=${String(out?.status || "unknown")}`,
+        `status=${String((out as any)?.status || "unknown")}`,
         `results=${results.length}`,
         `unique_domains=${uniqueDomains}`,
         `next_cursor=${nextCursor || "none"}`,
@@ -251,7 +269,7 @@ async function runGoogleAdsTransparencyCompact(
       ].join(" ")
     );
 
-    return out;
+    return out as any;
   } catch (error) {
     console.error(
       `[CRAWL] ERROR seed=${seed} error=${
@@ -1274,7 +1292,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.2.2",
+      "0.2.3",
 
     ingest_configured:
       Boolean(
@@ -1326,6 +1344,9 @@ app.get("/health", (_req, res) => {
 
     queue_max_attempts:
       4,
+
+    crawl_timeout_ms:
+      crawlTimeoutMs,
 
     supabase_configured:
       Boolean(
@@ -2164,7 +2185,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.2.2 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.2.3 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
