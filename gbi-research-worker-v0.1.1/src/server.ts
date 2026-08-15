@@ -41,7 +41,7 @@ type QueueRunNodeResult = {
   node_type: string;
   node_key: string;
   depth: number;
-  status: "done" | "failed" | "skip";
+  status: "done" | "failed" | "skip" | "retry";
   discovered_domains: number;
   result_count: number;
   next_cursor?: string;
@@ -831,17 +831,81 @@ async function claimDomainQueueNodes(
     : [];
 }
 
-async function finishDomainQueueNode(
+async function finishDomainQueueNodeProtected(
   id: string,
-  status: "done" | "failed" | "skip"
+  status: "done" | "failed" | "skip" | "blocked",
+  error?: string,
+  retryAfterSeconds?: number,
+  cooldownSeconds = 86_400,
+  maxAttempts = 4
 ): Promise<void> {
   await callSupabaseRpc(
-    "spy_finish_expansion_queue",
+    "spy_finish_expansion_queue_v2",
     {
       p_id: id,
       p_status: status,
+      p_error: error ?? null,
+      p_retry_after_seconds:
+        Number.isFinite(retryAfterSeconds)
+          ? Math.max(30, Number(retryAfterSeconds))
+          : null,
+      p_cooldown_seconds: cooldownSeconds,
+      p_max_attempts: maxAttempts,
     }
   );
+}
+
+function extractQueueRateLimitInfo(
+  workerOutput: any
+): {
+  http429Count: number;
+  retryAfterSeconds: number;
+} {
+  const rawPayloads = Array.isArray(workerOutput?.results)
+    ? workerOutput.results.map(getRawPayload)
+    : [];
+
+  const numeric = (value: unknown): number | undefined => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : undefined;
+  };
+
+  let http429Count =
+    numeric(workerOutput?.http_429_count) ??
+    numeric(workerOutput?.rate_limit_retries) ??
+    0;
+
+  let retryAfterSeconds =
+    numeric(workerOutput?.retry_after_seconds) ??
+    0;
+
+  for (const raw of rawPayloads) {
+    http429Count = Math.max(
+      http429Count,
+      numeric(raw?.http_429_count) ?? 0,
+      numeric(raw?.rate_limit_retries) ?? 0
+    );
+
+    retryAfterSeconds = Math.max(
+      retryAfterSeconds,
+      numeric(raw?.retry_after_seconds) ?? 0
+    );
+  }
+
+  const message = String(workerOutput?.message || "");
+
+  if (/429|rate.?limit/i.test(message) && http429Count === 0) {
+    http429Count = 1;
+  }
+
+  if (http429Count > 0 && retryAfterSeconds <= 0) {
+    retryAfterSeconds = 60;
+  }
+
+  return {
+    http429Count,
+    retryAfterSeconds,
+  };
 }
 
 function extractNextCursor(
@@ -1036,6 +1100,53 @@ async function processQueueRun(
         const workerStatus =
           String(out?.status || "").toLowerCase();
 
+        const {
+          http429Count,
+          retryAfterSeconds,
+        } = extractQueueRateLimitInfo(out);
+
+        const shouldRetry =
+          http429Count > 0 ||
+          workerStatus === "rate_limited" ||
+          workerStatus === "retry";
+
+        if (shouldRetry) {
+          const retryMessage =
+            `Rate limited: http429=${http429Count}; retry_after=${retryAfterSeconds}s`;
+
+          await finishDomainQueueNodeProtected(
+            node.id,
+            "failed",
+            retryMessage,
+            retryAfterSeconds,
+            86_400,
+            4
+          );
+
+          console.log(
+            `[QUEUE] RETRY node=${node.node_key} http429=${http429Count} retry_after=${retryAfterSeconds}s`
+          );
+
+          run.processed_nodes += 1;
+
+          run.results.push({
+            queue_id: node.id,
+            node_type: node.node_type,
+            node_key: node.node_key,
+            depth: node.depth,
+            status: "retry",
+            discovered_domains: 0,
+            result_count:
+              Array.isArray(out?.results)
+                ? out.results.length
+                : 0,
+            next_cursor: nextCursor,
+            message: retryMessage,
+          });
+
+          continue;
+        }
+
         const finalStatus:
           | "done"
           | "failed"
@@ -1044,14 +1155,36 @@ async function processQueueRun(
             ? "failed"
             : "done";
 
-        await finishDomainQueueNode(
-          node.id,
-          finalStatus
-        );
+        if (finalStatus === "done") {
+          await finishDomainQueueNodeProtected(
+            node.id,
+            "done",
+            undefined,
+            undefined,
+            86_400,
+            4
+          );
+        } else {
+          const workerMessage =
+            typeof out?.message === "string"
+              ? out.message
+              : `Worker status=${workerStatus || "failed"}`;
+
+          await finishDomainQueueNodeProtected(
+            node.id,
+            "failed",
+            workerMessage,
+            undefined,
+            86_400,
+            4
+          );
+        }
 
         run.processed_nodes += 1;
         run.discovered_domains +=
-          uniqueDomains.size;
+          finalStatus === "done"
+            ? uniqueDomains.size
+            : 0;
 
         run.results.push({
           queue_id: node.id,
@@ -1060,7 +1193,9 @@ async function processQueueRun(
           depth: node.depth,
           status: finalStatus,
           discovered_domains:
-            uniqueDomains.size,
+            finalStatus === "done"
+              ? uniqueDomains.size
+              : 0,
           result_count:
             Array.isArray(out?.results)
               ? out.results.length
@@ -1082,9 +1217,13 @@ async function processQueueRun(
         );
 
         try {
-          await finishDomainQueueNode(
+          await finishDomainQueueNodeProtected(
             node.id,
-            "failed"
+            "failed",
+            message,
+            undefined,
+            86_400,
+            4
           );
         } catch (finishError) {
           console.error(
@@ -1135,7 +1274,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.2.1",
+      "0.2.2",
 
     ingest_configured:
       Boolean(
@@ -1178,6 +1317,15 @@ app.get("/health", (_req, res) => {
 
     auto_queue_busy:
       autoQueueBusy,
+
+    queue_protection:
+      true,
+
+    queue_cooldown_seconds:
+      86400,
+
+    queue_max_attempts:
+      4,
 
     supabase_configured:
       Boolean(
@@ -2016,7 +2164,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.2.1 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.2.2 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
