@@ -8,13 +8,14 @@ import {
   resolveDomainFromImage,
   resolveDomainsFromImages,
 } from "./workers/image-domain-resolver.js";
+import { parseTransparencyCsv } from "./workers/csv-importer.js";
 
 import type { DiscoveryJob } from "./types/discovery.js";
 
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 const port = Number(process.env.PORT || 3000);
 const apiKey = process.env.WORKER_API_KEY || "";
@@ -406,7 +407,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.1.4",
+      "0.1.5",
 
     ingest_configured:
       Boolean(
@@ -415,6 +416,9 @@ app.get("/health", (_req, res) => {
       ),
 
     image_domain_resolver:
+      true,
+
+    csv_importer:
       true,
 
     time:
@@ -632,6 +636,157 @@ app.get(
 );
 
 /* =========================================================
+   TRANSPARENCY CSV IMPORT
+========================================================= */
+
+app.post(
+  "/import-transparency-csv",
+  auth,
+  async (req, res) => {
+    try {
+      const schema = z.object({
+        csvText: z
+          .string()
+          .min(1)
+          .max(10_000_000),
+
+        searchType: z
+          .enum(["domain", "advertiser"])
+          .optional(),
+
+        seed: z
+          .string()
+          .max(500)
+          .optional(),
+
+        resolveImages: z
+          .boolean()
+          .optional(),
+
+        concurrency: z
+          .number()
+          .int()
+          .min(1)
+          .max(5)
+          .optional(),
+      });
+
+      const parsed = schema.safeParse(req.body);
+
+      if (!parsed.success) {
+        return res.status(400).json({
+          ok: false,
+          error: parsed.error.flatten(),
+        });
+      }
+
+      const imported = parseTransparencyCsv(
+        parsed.data.csvText
+      );
+
+      let imageResolution:
+        | {
+            total: number;
+            resolved: number;
+            unresolved: number;
+            success_rate: number;
+            results: Awaited<
+              ReturnType<typeof resolveDomainsFromImages>
+            >;
+          }
+        | undefined;
+
+      if (
+        parsed.data.resolveImages &&
+        imported.imageUrls.length > 0
+      ) {
+        // Keep each OCR batch bounded so one large CSV does not
+        // overload the worker. Process all image URLs in chunks.
+        const allResults: Awaited<
+          ReturnType<typeof resolveDomainsFromImages>
+        > = [];
+
+        const chunkSize = 100;
+
+        for (
+          let offset = 0;
+          offset < imported.imageUrls.length;
+          offset += chunkSize
+        ) {
+          const chunk = imported.imageUrls.slice(
+            offset,
+            offset + chunkSize
+          );
+
+          const chunkResults =
+            await resolveDomainsFromImages(
+              chunk,
+              parsed.data.concurrency ?? 2
+            );
+
+          allResults.push(...chunkResults);
+        }
+
+        const resolved = allResults.filter(
+          (item) => item.primaryDomain
+        );
+
+        imageResolution = {
+          total: allResults.length,
+          resolved: resolved.length,
+          unresolved:
+            allResults.length - resolved.length,
+          success_rate:
+            allResults.length > 0
+              ? Number(
+                  (
+                    (resolved.length /
+                      allResults.length) *
+                    100
+                  ).toFixed(2)
+                )
+              : 0,
+          results: allResults,
+        };
+      }
+
+      return res.json({
+        ok: true,
+        searchType:
+          parsed.data.searchType ?? null,
+        seed:
+          parsed.data.seed ?? null,
+        summary: {
+          totalRows: imported.totalRows,
+          validRows: imported.validRows,
+          advertiserCount:
+            imported.advertisers.length,
+          imageCount:
+            imported.imageUrls.length,
+        },
+        advertisers: imported.advertisers,
+        imageUrls: imported.imageUrls,
+        rows: imported.rows,
+        imageResolution,
+      });
+    } catch (error) {
+      console.error(
+        "[IMPORT TRANSPARENCY CSV ERROR]",
+        error
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unknown CSV import error",
+      });
+    }
+  }
+);
+
+/* =========================================================
    IMAGE -> DOMAIN
 ========================================================= */
 
@@ -830,10 +985,10 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.1.4 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.1.5 listening on :${port} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
-      )} | image-resolver=true`
+      )} | image-resolver=true | csv-importer=true`
     );
   }
 );
