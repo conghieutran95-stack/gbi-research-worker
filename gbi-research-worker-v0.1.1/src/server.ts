@@ -188,6 +188,8 @@ type SerpApiCreative = {
   format?: string;
   target_domain?: string;
   link?: string;
+  visible_link?: string;
+  image?: string;
   first_shown?: number | string;
   last_shown?: number | string;
   total_days_shown?: number;
@@ -289,6 +291,38 @@ async function serpApiRequest(
   return data;
 }
 
+function collectDetailDomainCandidates(detail: any): string[] {
+  const candidates: string[] = [];
+  const push = (value: unknown) => {
+    const domain = normalizeDomain(value);
+    if (domain && !candidates.includes(domain)) candidates.push(domain);
+  };
+
+  const creatives = Array.isArray(detail?.ad_creatives)
+    ? detail.ad_creatives
+    : [];
+
+  for (const item of creatives) {
+    push(item?.link);
+    push(item?.visible_link);
+
+    if (Array.isArray(item?.carousel_data)) {
+      for (const slide of item.carousel_data) {
+        push(slide?.button_link);
+        push(slide?.link);
+      }
+    }
+
+    if (Array.isArray(item?.images)) {
+      for (const image of item.images) {
+        push(image?.link);
+      }
+    }
+  }
+
+  return candidates;
+}
+
 async function resolveSerpApiCreativeDomain(
   creative: SerpApiCreative,
   country: string | undefined,
@@ -296,12 +330,14 @@ async function resolveSerpApiCreativeDomain(
 ): Promise<string | undefined> {
   const direct = normalizeDomain(
     creative.target_domain ||
+      creative.visible_link ||
       (creative.link && !creative.link.includes("googleusercontent.com")
         ? creative.link
         : undefined)
   );
   if (direct) return direct;
 
+  // A details request is only possible when both IDs exist.
   if (!creative.advertiser_id || !creative.ad_creative_id) return undefined;
 
   const detail = await serpApiRequest(
@@ -315,13 +351,38 @@ async function resolveSerpApiCreativeDomain(
   );
   stats.details_fetched += 1;
 
+  const candidates = collectDetailDomainCandidates(detail);
+  if (candidates.length > 0) return candidates[0];
+
+  // Some creatives are returned as a flattened image with no structured link.
+  // In that case use the existing image-domain resolver as a fallback.
   const detailCreatives = Array.isArray(detail?.ad_creatives)
     ? detail.ad_creatives
     : [];
 
   for (const item of detailCreatives) {
-    const candidate = normalizeDomain(item?.link || item?.visible_link);
-    if (candidate) return candidate;
+    const imageUrl =
+      typeof item?.image === "string" && item.image.trim()
+        ? item.image.trim()
+        : undefined;
+
+    if (!imageUrl) continue;
+
+    try {
+      const resolved: any = await resolveDomainFromImage(imageUrl);
+      const candidate = normalizeDomain(
+        resolved?.primaryDomain ??
+          resolved?.domain ??
+          (Array.isArray(resolved?.domains) ? resolved.domains[0] : undefined)
+      );
+      if (candidate) return candidate;
+    } catch (error) {
+      console.warn(
+        `[SERPAPI_ADVERTISER] IMAGE_RESOLVE_FAIL advertiser=${creative.advertiser_id} creative=${creative.ad_creative_id} error=${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
   }
 
   return undefined;
@@ -552,7 +613,10 @@ async function runSerpApiAdvertiserExpansion(
   >();
 
   let nextPageToken: string | undefined;
-  let detailBudget = serpApiMaxDetailsPerAdvertiser;
+  // Never waste the detail budget on creatives that do not have a creative ID.
+  // Keep at least one details lookup enabled so advertiser expansion can resolve
+  // destination domains even if the environment variable was accidentally 0.
+  let detailBudget = Math.max(1, serpApiMaxDetailsPerAdvertiser);
   let noNewDomainPages = 0;
 
   for (let page = 0; page < serpApiMaxPagesPerAdvertiser; page += 1) {
@@ -569,44 +633,41 @@ async function runSerpApiAdvertiserExpansion(
       stats
     );
 
-    console.log(
-      "[SERPAPI_ADVERTISER_RAW]",
-      JSON.stringify(
-        {
-          advertiser: advertiserKey,
-          top_level_keys: Object.keys(data || {}),
-          ad_creatives_count: Array.isArray(data?.ad_creatives)
-            ? data.ad_creatives.length
-            : null,
-          first_creative: Array.isArray(data?.ad_creatives)
-            ? data.ad_creatives[0]
-            : null,
-          serpapi_pagination: data?.serpapi_pagination ?? null,
-          search_information: data?.search_information ?? null,
-          full_response: data,
-        },
-        null,
-        2
-      )
-    );
-
     stats.pages_fetched += 1;
 
     const creatives: SerpApiCreative[] = Array.isArray(data?.ad_creatives)
       ? data.ad_creatives
       : [];
 
+    const creativesWithIds = creatives.filter(
+      (creative) =>
+        typeof creative?.ad_creative_id === "string" &&
+        creative.ad_creative_id.trim()
+    ).length;
+
+    console.log(
+      `[SERPAPI_ADVERTISER] PAGE advertiser=${advertiserKey} page=${page + 1} creatives=${creatives.length} creatives_with_id=${creativesWithIds} detail_budget=${detailBudget}`
+    );
+
     for (const creative of creatives) {
-      // Some SerpApi responses omit advertiser_id when queried directly.
-      // Attach the queue advertiser so downstream ingest can build the edge.
       const enrichedCreative: SerpApiCreative = {
         ...creative,
         advertiser_id: creative.advertiser_id || advertiserKey,
       };
 
-      let domain = normalizeDomain(enrichedCreative.target_domain);
+      let domain = normalizeDomain(
+        enrichedCreative.target_domain ||
+          enrichedCreative.visible_link ||
+          enrichedCreative.link
+      );
 
-      if (!domain && detailBudget > 0) {
+      const canFetchDetail = Boolean(
+        enrichedCreative.advertiser_id &&
+          enrichedCreative.ad_creative_id &&
+          detailBudget > 0
+      );
+
+      if (!domain && canFetchDetail) {
         try {
           domain = await resolveSerpApiCreativeDomain(
             enrichedCreative,
@@ -615,10 +676,14 @@ async function runSerpApiAdvertiserExpansion(
           );
         } catch (error) {
           console.warn(
-            `[SERPAPI_ADVERTISER] DETAIL_FAIL advertiser=${advertiserKey} creative=${enrichedCreative.ad_creative_id || "unknown"} error=${error instanceof Error ? error.message : String(error)}`
+            `[SERPAPI_ADVERTISER] DETAIL_FAIL advertiser=${advertiserKey} creative=${enrichedCreative.ad_creative_id || "unknown"} error=${
+              error instanceof Error ? error.message : String(error)
+            }`
           );
+        } finally {
+          // Decrement only when a details request was actually eligible to run.
+          detailBudget -= 1;
         }
-        detailBudget -= 1;
       }
 
       if (!domain) continue;
@@ -649,6 +714,7 @@ async function runSerpApiAdvertiserExpansion(
         ? data.serpapi_pagination.next_page_token
         : undefined;
 
+    // Stop if pagination ended. Also stop after an empty-domain page to protect quota.
     if (!nextPageToken || noNewDomainPages >= 1) break;
   }
 
@@ -2156,7 +2222,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.4.0",
+      "0.4.1",
 
     provider_primary:
       serpApiEnabled && serpApiKey ? "serpapi" : "playwright",
@@ -2172,6 +2238,9 @@ app.get("/health", (_req, res) => {
 
     serpapi_max_advertisers_per_seed:
       serpApiMaxAdvertisersPerSeed,
+
+    serpapi_max_details_per_advertiser:
+      serpApiMaxDetailsPerAdvertiser,
 
     ingest_configured:
       Boolean(
@@ -3097,7 +3166,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.4.0 listening on :${port} | provider=${
+      `GBI Research Worker v0.4.1 listening on :${port} | provider=${
         serpApiEnabled && serpApiKey ? "serpapi" : "playwright"
       } | serpapi=${Boolean(serpApiKey)} | ingest=${Boolean(
         ingestUrl &&
