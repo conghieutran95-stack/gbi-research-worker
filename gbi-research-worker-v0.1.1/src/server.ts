@@ -569,6 +569,27 @@ async function runSerpApiAdvertiserExpansion(
       stats
     );
 
+    console.log(
+      "[SERPAPI_ADVERTISER_RAW]",
+      JSON.stringify(
+        {
+          advertiser: advertiserKey,
+          top_level_keys: Object.keys(data || {}),
+          ad_creatives_count: Array.isArray(data?.ad_creatives)
+            ? data.ad_creatives.length
+            : null,
+          first_creative: Array.isArray(data?.ad_creatives)
+            ? data.ad_creatives[0]
+            : null,
+          serpapi_pagination: data?.serpapi_pagination ?? null,
+          search_information: data?.search_information ?? null,
+          full_response: data,
+        },
+        null,
+        2
+      )
+    );
+
     stats.pages_fetched += 1;
 
     const creatives: SerpApiCreative[] = Array.isArray(data?.ad_creatives)
