@@ -525,6 +525,166 @@ async function runSerpApiAdsTransparency(
   };
 }
 
+async function runSerpApiAdvertiserExpansion(
+  advertiserId: string,
+  country?: string
+): Promise<any> {
+  const advertiserKey = advertiserId.trim();
+  const stats: SerpApiStats = {
+    api_requests: 0,
+    advertiser_count: 1,
+    pages_fetched: 0,
+    details_fetched: 0,
+    domains_discovered: 0,
+  };
+  const region = serpRegion(country);
+
+  console.log(
+    `[SERPAPI_ADVERTISER] START advertiser=${advertiserKey} country=${country || "any"}`
+  );
+
+  const domainMap = new Map<
+    string,
+    {
+      creativeIds: Set<string>;
+      dates: string[];
+    }
+  >();
+
+  let nextPageToken: string | undefined;
+  let detailBudget = serpApiMaxDetailsPerAdvertiser;
+  let noNewDomainPages = 0;
+
+  for (let page = 0; page < serpApiMaxPagesPerAdvertiser; page += 1) {
+    const before = domainMap.size;
+    const data = await serpApiRequest(
+      {
+        engine: "google_ads_transparency_center",
+        advertiser_id: advertiserKey,
+        platform: "SEARCH",
+        region,
+        num: 100,
+        next_page_token: nextPageToken,
+      },
+      stats
+    );
+
+    stats.pages_fetched += 1;
+
+    const creatives: SerpApiCreative[] = Array.isArray(data?.ad_creatives)
+      ? data.ad_creatives
+      : [];
+
+    for (const creative of creatives) {
+      // Some SerpApi responses omit advertiser_id when queried directly.
+      // Attach the queue advertiser so downstream ingest can build the edge.
+      const enrichedCreative: SerpApiCreative = {
+        ...creative,
+        advertiser_id: creative.advertiser_id || advertiserKey,
+      };
+
+      let domain = normalizeDomain(enrichedCreative.target_domain);
+
+      if (!domain && detailBudget > 0) {
+        try {
+          domain = await resolveSerpApiCreativeDomain(
+            enrichedCreative,
+            country,
+            stats
+          );
+        } catch (error) {
+          console.warn(
+            `[SERPAPI_ADVERTISER] DETAIL_FAIL advertiser=${advertiserKey} creative=${enrichedCreative.ad_creative_id || "unknown"} error=${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+        detailBudget -= 1;
+      }
+
+      if (!domain) continue;
+
+      const current = domainMap.get(domain) || {
+        creativeIds: new Set<string>(),
+        dates: [],
+      };
+
+      if (enrichedCreative.ad_creative_id) {
+        current.creativeIds.add(enrichedCreative.ad_creative_id);
+      }
+
+      const first = unixToIso(enrichedCreative.first_shown);
+      const last = unixToIso(enrichedCreative.last_shown);
+      if (first) current.dates.push(first);
+      if (last) current.dates.push(last);
+
+      domainMap.set(domain, current);
+    }
+
+    const after = domainMap.size;
+    if (after === before) noNewDomainPages += 1;
+    else noNewDomainPages = 0;
+
+    nextPageToken =
+      typeof data?.serpapi_pagination?.next_page_token === "string"
+        ? data.serpapi_pagination.next_page_token
+        : undefined;
+
+    if (!nextPageToken || noNewDomainPages >= 1) break;
+  }
+
+  const results = [...domainMap.entries()].map(([domain, item]) => {
+    const dates = [...new Set(item.dates)].sort();
+    const first = dates[0];
+    const last = dates.length ? dates[dates.length - 1] : undefined;
+
+    return {
+      domain,
+      creative_count: Math.max(1, item.creativeIds.size),
+      first_seen: first,
+      last_seen: last,
+      activity_status: "UNKNOWN",
+      observed_at: new Date().toISOString(),
+      source_ref: advertiserKey,
+      raw_payload: {
+        mode: "SERPAPI_ADVERTISER_EXPANSION",
+        provider: "serpapi",
+        advertiser_id: advertiserKey,
+        advertiser_ids: [advertiserKey],
+        advertisers: [
+          {
+            advertiser_id: advertiserKey,
+            advertiser_name: "",
+          },
+        ],
+        discovered_domain: domain,
+        creative_count: Math.max(1, item.creativeIds.size),
+        ads_first_seen: first,
+        ads_last_seen: last,
+        crawler_discovered_at: new Date().toISOString(),
+        crawler_last_checked_at: new Date().toISOString(),
+        discovered_via: "SERPAPI_ADVERTISER_EXPANSION",
+        serpapi_stats: stats,
+      },
+    };
+  });
+
+  stats.domains_discovered = results.length;
+
+  console.log(
+    `[SERPAPI_ADVERTISER] DONE advertiser=${advertiserKey} domains=${stats.domains_discovered} requests=${stats.api_requests} pages=${stats.pages_fetched} details=${stats.details_fetched}`
+  );
+
+  return {
+    status: "completed",
+    provider: "serpapi",
+    message:
+      `SerpApi advertiser expansion completed. advertiser=${advertiserKey}; ` +
+      `domains=${stats.domains_discovered}; requests=${stats.api_requests}; ` +
+      `pages=${stats.pages_fetched}; details=${stats.details_fetched}.`,
+    results,
+    stats,
+  };
+}
+
 async function runSpyAdsDiscoveryCompact(
   seed: string,
   country?: string
@@ -573,6 +733,7 @@ const compactLogAllowPatterns = [
   /^\[SPY ADS .*RATE_LIMIT_STOP/i,
   /^\[SPY ADS .*ERROR/i,
   /^\[SERPAPI\]/,
+  /^\[SERPAPI_ADVERTISER\]/,
   /^GBI Research Worker/,
   /^Starting Container/,
 ];
@@ -1343,6 +1504,35 @@ async function claimDomainQueueNodes(
     : [];
 }
 
+async function claimAdvertiserQueueNodes(
+  limit: number
+): Promise<ClaimedQueueNode[]> {
+  const data = await callSupabaseRpc(
+    "spy_claim_advertiser_expansion_queue",
+    {
+      p_limit: limit,
+    }
+  );
+
+  return Array.isArray(data)
+    ? data.map((item: any) => ({
+        id: String(item.id),
+        node_type: String(item.node_type),
+        node_key: String(item.node_key),
+        depth: Number(item.depth || 0),
+        priority: Number(item.priority || 0),
+        parent_type:
+          item.parent_type == null
+            ? null
+            : String(item.parent_type),
+        parent_key:
+          item.parent_key == null
+            ? null
+            : String(item.parent_key),
+      }))
+    : [];
+}
+
 async function finishDomainQueueNodeProtected(
   id: string,
   status: "done" | "failed" | "skip" | "blocked",
@@ -1615,17 +1805,25 @@ async function processQueueRun(
   run.started_at = new Date().toISOString();
 
   try {
-    const nodes = await claimDomainQueueNodes(
-      run.requested_limit,
-      run.max_depth
+    // Prefer advertiser expansion so DOMAIN -> ADVERTISER -> DOMAIN can
+    // complete before we spend more searches expanding newly discovered domains.
+    let nodes = await claimAdvertiserQueueNodes(
+      run.requested_limit
     );
+
+    if (nodes.length === 0) {
+      nodes = await claimDomainQueueNodes(
+        run.requested_limit,
+        run.max_depth
+      );
+    }
 
     run.claimed_nodes = nodes.length;
 
     if (nodes.length === 0) {
       run.status = "completed";
       run.message =
-        "No pending domain/domain_cursor nodes available within max_depth.";
+        "No pending advertiser or domain/domain_cursor nodes available.";
       return;
     }
 
@@ -1635,10 +1833,16 @@ async function processQueueRun(
           `[QUEUE] Processing ${node.node_type}:${node.node_key} depth=${node.depth}`
         );
 
-        const out = await runSpyAdsDiscoveryCompact(
-          node.node_key,
-          run.country
-        );
+        const out =
+          node.node_type === "advertiser"
+            ? await runSerpApiAdvertiserExpansion(
+                node.node_key,
+                run.country
+              )
+            : await runSpyAdsDiscoveryCompact(
+                node.node_key,
+                run.country
+              );
 
         const rows = buildQueueDiscoveryRows(out);
         const uniqueDomains = new Set(
@@ -1931,7 +2135,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.3.0",
+      "0.4.0",
 
     provider_primary:
       serpApiEnabled && serpApiKey ? "serpapi" : "playwright",
@@ -1964,7 +2168,7 @@ app.get("/health", (_req, res) => {
       true,
 
     queue_runner_mode:
-      "domain_only_v1",
+      "domain_and_advertiser_v2",
 
     crawler_log_mode:
       crawlerLogMode,
@@ -2872,7 +3076,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.3.0 listening on :${port} | provider=${
+      `GBI Research Worker v0.4.0 listening on :${port} | provider=${
         serpApiEnabled && serpApiKey ? "serpapi" : "playwright"
       } | serpapi=${Boolean(serpApiKey)} | ingest=${Boolean(
         ingestUrl &&
