@@ -34,6 +34,29 @@ const supabaseUrl = normalizeSupabaseBaseUrl(
 );
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
+const serpApiKey = process.env.SERPAPI_API_KEY || "";
+const serpApiEnabled =
+  (process.env.SERPAPI_ENABLED || "false").trim().toLowerCase() === "true";
+const serpApiMaxPagesPerAdvertiser = Math.max(
+  1,
+  Math.min(10, Number(process.env.SERPAPI_MAX_PAGES_PER_ADVERTISER || 2))
+);
+const serpApiMaxAdvertisersPerSeed = Math.max(
+  1,
+  Math.min(100, Number(process.env.SERPAPI_MAX_ADVERTISERS_PER_SEED || 20))
+);
+const serpApiMaxDetailsPerAdvertiser = Math.max(
+  0,
+  Math.min(50, Number(process.env.SERPAPI_MAX_DETAILS_PER_ADVERTISER || 10))
+);
+const serpApiFallbackOnEmpty =
+  (process.env.SERPAPI_FALLBACK_ON_EMPTY || "true").trim().toLowerCase() === "true";
+const serpApiTimeoutMs = Math.max(
+  10_000,
+  Number(process.env.SERPAPI_TIMEOUT_MS || 45_000)
+);
+
+
 const jobs = new Map<string, DiscoveryJob>();
 
 type QueueRunNodeResult = {
@@ -155,6 +178,381 @@ function getRawPayload(result: any): any {
 
 
 /* =========================================================
+   SERPAPI GOOGLE ADS TRANSPARENCY PROVIDER
+========================================================= */
+
+type SerpApiCreative = {
+  advertiser_id?: string;
+  advertiser?: string;
+  ad_creative_id?: string;
+  format?: string;
+  target_domain?: string;
+  link?: string;
+  first_shown?: number | string;
+  last_shown?: number | string;
+  total_days_shown?: number;
+  details_link?: string;
+  serpapi_details_link?: string;
+};
+
+type SerpApiStats = {
+  api_requests: number;
+  advertiser_count: number;
+  pages_fetched: number;
+  details_fetched: number;
+  domains_discovered: number;
+};
+
+const serpRegionByCountry: Record<string, string> = {
+  US: "2840",
+  GB: "2826",
+  UK: "2826",
+  CA: "2124",
+  AU: "2036",
+  DE: "2276",
+  FR: "2250",
+  IT: "2380",
+  ES: "2724",
+  NL: "2528",
+  NZ: "2554",
+  SG: "2702",
+  HK: "2344",
+  JP: "2392",
+  KR: "2410",
+};
+
+function serpRegion(country?: string): string | undefined {
+  const key = (country || "").trim().toUpperCase();
+  return serpRegionByCountry[key];
+}
+
+function unixToIso(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const ms = value > 10_000_000_000 ? value : value * 1000;
+    const date = new Date(ms);
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+  }
+  if (typeof value === "string" && value.trim()) {
+    if (/^\d+$/.test(value.trim())) {
+      return unixToIso(Number(value.trim()));
+    }
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+  }
+  return undefined;
+}
+
+async function serpApiRequest(
+  params: Record<string, string | number | undefined>,
+  stats: SerpApiStats
+): Promise<any> {
+  if (!serpApiKey) {
+    throw new Error("SERPAPI_API_KEY is missing");
+  }
+
+  const url = new URL("https://serpapi.com/search.json");
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === "") continue;
+    url.searchParams.set(key, String(value));
+  }
+  url.searchParams.set("api_key", serpApiKey);
+  url.searchParams.set("output", "json");
+
+  stats.api_requests += 1;
+
+  const response = await fetch(url, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(serpApiTimeoutMs),
+  });
+
+  const text = await response.text();
+  let data: any = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    throw new Error(
+      `SerpApi returned non-JSON HTTP ${response.status}: ${text.slice(0, 300)}`
+    );
+  }
+
+  if (!response.ok || data?.error) {
+    throw new Error(
+      `SerpApi HTTP ${response.status}: ${String(data?.error || text).slice(0, 500)}`
+    );
+  }
+
+  const status = String(data?.search_metadata?.status || "Success").toLowerCase();
+  if (status === "error") {
+    throw new Error(`SerpApi search error: ${String(data?.error || "unknown error")}`);
+  }
+
+  return data;
+}
+
+async function resolveSerpApiCreativeDomain(
+  creative: SerpApiCreative,
+  country: string | undefined,
+  stats: SerpApiStats
+): Promise<string | undefined> {
+  const direct = normalizeDomain(
+    creative.target_domain ||
+      (creative.link && !creative.link.includes("googleusercontent.com")
+        ? creative.link
+        : undefined)
+  );
+  if (direct) return direct;
+
+  if (!creative.advertiser_id || !creative.ad_creative_id) return undefined;
+
+  const detail = await serpApiRequest(
+    {
+      engine: "google_ads_transparency_center_ad_details",
+      advertiser_id: creative.advertiser_id,
+      creative_id: creative.ad_creative_id,
+      region: serpRegion(country),
+    },
+    stats
+  );
+  stats.details_fetched += 1;
+
+  const detailCreatives = Array.isArray(detail?.ad_creatives)
+    ? detail.ad_creatives
+    : [];
+
+  for (const item of detailCreatives) {
+    const candidate = normalizeDomain(item?.link || item?.visible_link);
+    if (candidate) return candidate;
+  }
+
+  return undefined;
+}
+
+async function runSerpApiAdsTransparency(
+  seed: string,
+  country?: string
+): Promise<any> {
+  const { seedDomain } = parseSeedCursor(seed);
+  const stats: SerpApiStats = {
+    api_requests: 0,
+    advertiser_count: 0,
+    pages_fetched: 0,
+    details_fetched: 0,
+    domains_discovered: 0,
+  };
+  const region = serpRegion(country);
+
+  console.log(
+    `[SERPAPI] START seed=${seedDomain} country=${country || "any"}`
+  );
+
+  const seedSearch = await serpApiRequest(
+    {
+      engine: "google_ads_transparency_center",
+      text: seedDomain,
+      platform: "SEARCH",
+      region,
+      num: 100,
+    },
+    stats
+  );
+  stats.pages_fetched += 1;
+
+  const seedCreatives: SerpApiCreative[] = Array.isArray(seedSearch?.ad_creatives)
+    ? seedSearch.ad_creatives
+    : [];
+
+  const advertiserMap = new Map<string, string>();
+  for (const creative of seedCreatives) {
+    if (!creative?.advertiser_id) continue;
+    if (!advertiserMap.has(creative.advertiser_id)) {
+      advertiserMap.set(creative.advertiser_id, creative.advertiser || "");
+    }
+  }
+
+  const advertisers = [...advertiserMap.entries()]
+    .slice(0, serpApiMaxAdvertisersPerSeed)
+    .map(([advertiser_id, advertiser_name]) => ({
+      advertiser_id,
+      advertiser_name,
+    }));
+  stats.advertiser_count = advertisers.length;
+
+  const domainMap = new Map<
+    string,
+    {
+      creativeIds: Set<string>;
+      advertisers: Map<string, string>;
+      dates: string[];
+    }
+  >();
+
+  const addDomain = (
+    domainValue: unknown,
+    creative: SerpApiCreative,
+    advertiserName?: string
+  ) => {
+    const domain = normalizeDomain(domainValue);
+    if (!domain) return;
+
+    const current = domainMap.get(domain) || {
+      creativeIds: new Set<string>(),
+      advertisers: new Map<string, string>(),
+      dates: [],
+    };
+    if (creative.ad_creative_id) current.creativeIds.add(creative.ad_creative_id);
+    if (creative.advertiser_id) {
+      current.advertisers.set(
+        creative.advertiser_id,
+        advertiserName || creative.advertiser || ""
+      );
+    }
+    const first = unixToIso(creative.first_shown);
+    const last = unixToIso(creative.last_shown);
+    if (first) current.dates.push(first);
+    if (last) current.dates.push(last);
+    domainMap.set(domain, current);
+  };
+
+  // Keep seed-search evidence too. This is cheap and confirms advertiser ↔ seed.
+  for (const creative of seedCreatives) {
+    addDomain(creative.target_domain || seedDomain, creative);
+  }
+
+  for (const advertiser of advertisers) {
+    let nextPageToken: string | undefined;
+    let detailBudget = serpApiMaxDetailsPerAdvertiser;
+    let noNewDomainPages = 0;
+
+    for (let page = 0; page < serpApiMaxPagesPerAdvertiser; page += 1) {
+      const before = domainMap.size;
+      const data = await serpApiRequest(
+        {
+          engine: "google_ads_transparency_center",
+          advertiser_id: advertiser.advertiser_id,
+          platform: "SEARCH",
+          region,
+          num: 100,
+          next_page_token: nextPageToken,
+        },
+        stats
+      );
+      stats.pages_fetched += 1;
+
+      const creatives: SerpApiCreative[] = Array.isArray(data?.ad_creatives)
+        ? data.ad_creatives
+        : [];
+
+      for (const creative of creatives) {
+        let domain = normalizeDomain(creative.target_domain);
+
+        if (!domain && detailBudget > 0) {
+          try {
+            domain = await resolveSerpApiCreativeDomain(creative, country, stats);
+          } catch (error) {
+            console.warn(
+              `[SERPAPI] DETAIL_FAIL advertiser=${advertiser.advertiser_id} creative=${creative.ad_creative_id || "unknown"} error=${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+          detailBudget -= 1;
+        }
+
+        if (domain) addDomain(domain, creative, advertiser.advertiser_name);
+      }
+
+      const after = domainMap.size;
+      if (after === before) noNewDomainPages += 1;
+      else noNewDomainPages = 0;
+
+      nextPageToken =
+        typeof data?.serpapi_pagination?.next_page_token === "string"
+          ? data.serpapi_pagination.next_page_token
+          : undefined;
+
+      if (!nextPageToken || noNewDomainPages >= 1) break;
+    }
+  }
+
+  const results = [...domainMap.entries()].map(([domain, item]) => {
+    const dates = [...new Set(item.dates)].sort();
+    const advertiserRows = [...item.advertisers.entries()].map(
+      ([advertiser_id, advertiser_name]) => ({ advertiser_id, advertiser_name })
+    );
+    const first = dates[0];
+    const last = dates.length ? dates[dates.length - 1] : undefined;
+
+    return {
+      domain,
+      creative_count: item.creativeIds.size,
+      first_seen: first,
+      last_seen: last,
+      activity_status: "UNKNOWN",
+      observed_at: new Date().toISOString(),
+      source_ref: seedDomain,
+      raw_payload: {
+        mode: "SERPAPI_GOOGLE_ADS_TRANSPARENCY",
+        provider: "serpapi",
+        seed_domain: seedDomain,
+        discovered_domain: domain,
+        advertiser_count: advertiserRows.length,
+        advertiser_ids: advertiserRows.map((x) => x.advertiser_id),
+        advertisers: advertiserRows,
+        creative_count: item.creativeIds.size,
+        ads_first_seen: first,
+        ads_last_seen: last,
+        crawler_discovered_at: new Date().toISOString(),
+        crawler_last_checked_at: new Date().toISOString(),
+        discovered_via: "SERPAPI_ADVERTISER_EXPANSION",
+        serpapi_stats: stats,
+      },
+    };
+  });
+
+  stats.domains_discovered = results.length;
+
+  console.log(
+    `[SERPAPI] DONE seed=${seedDomain} advertisers=${stats.advertiser_count} domains=${stats.domains_discovered} requests=${stats.api_requests} pages=${stats.pages_fetched} details=${stats.details_fetched}`
+  );
+
+  return {
+    status: "completed",
+    provider: "serpapi",
+    message:
+      `SerpApi completed. advertisers=${stats.advertiser_count}; ` +
+      `domains=${stats.domains_discovered}; requests=${stats.api_requests}; ` +
+      `pages=${stats.pages_fetched}; details=${stats.details_fetched}.`,
+    results,
+    stats,
+  };
+}
+
+async function runSpyAdsDiscoveryCompact(
+  seed: string,
+  country?: string
+): Promise<any> {
+  if (serpApiEnabled && serpApiKey) {
+    try {
+      const out = await runSerpApiAdsTransparency(seed, country);
+      const resultCount = Array.isArray(out?.results) ? out.results.length : 0;
+      if (resultCount > 0 || !serpApiFallbackOnEmpty) {
+        return out;
+      }
+      console.warn(
+        `[SERPAPI] EMPTY seed=${seed} fallback=playwright`
+      );
+    } catch (error) {
+      console.warn(
+        `[SERPAPI] FAILED seed=${seed} fallback=playwright error=${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  return runGoogleAdsTransparencyCompact(seed, country);
+}
+
+
+/* =========================================================
    LOW-LOG CRAWLER WRAPPER
 ========================================================= */
 
@@ -174,6 +572,7 @@ const compactLogAllowPatterns = [
   /^\[SPY ADS .*CIRCUIT_BREAKER/i,
   /^\[SPY ADS .*RATE_LIMIT_STOP/i,
   /^\[SPY ADS .*ERROR/i,
+  /^\[SERPAPI\]/,
   /^GBI Research Worker/,
   /^Starting Container/,
 ];
@@ -1180,7 +1579,21 @@ async function ingestQueueDomainWorkerResults(
   workerOutput: any
 ): Promise<any> {
   const rows = buildQueueDiscoveryRows(workerOutput);
+  const dedupedRows = Array.from(
+    new Map(
+      rows.map((row) => [
+        `${normalizeDomain(row.domain) || ""}::${String(row.advertiser_id || "")}`,
+        row,
+      ])
+    ).values()
+  ).filter((row) => row.domain && row.advertiser_id);
   const nextCursor = extractNextCursor(workerOutput);
+
+  if (dedupedRows.length !== rows.length) {
+    console.log(
+      `[QUEUE] DEDUPE rows_in=${rows.length} rows_out=${dedupedRows.length}`
+    );
+  }
 
   return callSupabaseRpc(
     "spy_ingest_queue_domain_results",
@@ -1188,7 +1601,7 @@ async function ingestQueueDomainWorkerResults(
       p_queue_id: node.id,
       p_seed: node.node_key,
       p_depth: node.depth,
-      p_results: rows,
+      p_results: dedupedRows,
       p_next_cursor: nextCursor ?? null,
     },
     60_000
@@ -1222,7 +1635,7 @@ async function processQueueRun(
           `[QUEUE] Processing ${node.node_type}:${node.node_key} depth=${node.depth}`
         );
 
-        const out = await runGoogleAdsTransparencyCompact(
+        const out = await runSpyAdsDiscoveryCompact(
           node.node_key,
           run.country
         );
@@ -1518,7 +1931,22 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.2.8",
+      "0.3.0",
+
+    provider_primary:
+      serpApiEnabled && serpApiKey ? "serpapi" : "playwright",
+
+    serpapi_enabled:
+      serpApiEnabled,
+
+    serpapi_configured:
+      Boolean(serpApiKey),
+
+    serpapi_max_pages_per_advertiser:
+      serpApiMaxPagesPerAdvertiser,
+
+    serpapi_max_advertisers_per_seed:
+      serpApiMaxAdvertisersPerSeed,
 
     ingest_configured:
       Boolean(
@@ -1687,7 +2115,7 @@ app.post(
 
       try {
         const out =
-          await runGoogleAdsTransparencyCompact(
+          await runSpyAdsDiscoveryCompact(
             job.seed,
             job.country
           );
@@ -2444,7 +2872,9 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.2.8 listening on :${port} | ingest=${Boolean(
+      `GBI Research Worker v0.3.0 listening on :${port} | provider=${
+        serpApiEnabled && serpApiKey ? "serpapi" : "playwright"
+      } | serpapi=${Boolean(serpApiKey)} | ingest=${Boolean(
         ingestUrl &&
           ingestToken
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
