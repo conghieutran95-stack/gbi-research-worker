@@ -1774,6 +1774,35 @@ async function claimAdvertiserQueueNodes(
     : [];
 }
 
+
+async function claimExpansionQueueNodes(
+  limit: number,
+  maxDepth: number
+): Promise<ClaimedQueueNode[]> {
+  const data = await callSupabaseRpc(
+    "spy_claim_expansion_queue_v3",
+    {
+      p_limit: limit,
+      p_max_depth: maxDepth,
+    },
+    30_000
+  );
+
+  return Array.isArray(data)
+    ? data.map((item: any) => ({
+        id: String(item.id),
+        node_type: String(item.node_type),
+        node_key: String(item.node_key),
+        depth: Number(item.depth || 0),
+        priority: Number(item.priority || 0),
+        parent_type:
+          item.parent_type == null ? null : String(item.parent_type),
+        parent_key:
+          item.parent_key == null ? null : String(item.parent_key),
+      }))
+    : [];
+}
+
 async function finishDomainQueueNodeProtected(
   id: string,
   status: "done" | "failed" | "skip" | "blocked",
@@ -2046,18 +2075,12 @@ async function processQueueRun(
   run.started_at = new Date().toISOString();
 
   try {
-    // Prefer advertiser expansion so DOMAIN -> ADVERTISER -> DOMAIN can
-    // complete before we spend more searches expanding newly discovered domains.
-    let nodes = await claimAdvertiserQueueNodes(
-      run.requested_limit
+    // Unified claim: advertiser nodes are preferred by DB scoring, but
+    // eligible domain/domain_cursor nodes are claimed when no advertiser is ready.
+    const nodes = await claimExpansionQueueNodes(
+      run.requested_limit,
+      run.max_depth
     );
-
-    if (nodes.length === 0) {
-      nodes = await claimDomainQueueNodes(
-        run.requested_limit,
-        run.max_depth
-      );
-    }
 
     run.claimed_nodes = nodes.length;
 
@@ -3534,7 +3557,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.4.4 listening on :${port} | provider=${
+      `GBI Research Worker v0.4.6 listening on :${port} | provider=${
         serpApiEnabled && serpApiKey ? "serpapi" : "playwright"
       } | serpapi=${Boolean(serpApiKey)} | ingest=${Boolean(
         ingestUrl &&
