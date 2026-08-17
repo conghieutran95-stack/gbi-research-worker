@@ -1519,6 +1519,60 @@ async function callSupabaseRpc(
   }
 }
 
+
+async function countNewDomainsBeforeIngest(
+  domains: string[]
+): Promise<number | undefined> {
+  const normalized = [...new Set(
+    domains
+      .map((domain) => normalizeDomain(domain))
+      .filter((domain): domain is string => Boolean(domain))
+  )];
+
+  if (normalized.length === 0) return 0;
+
+  try {
+    const out = await callSupabaseRpc(
+      "spy_count_new_domains_v1",
+      { p_domains: normalized },
+      30_000
+    );
+
+    const count = Number(out);
+    return Number.isFinite(count) ? Math.max(0, count) : undefined;
+  } catch (error) {
+    console.warn(
+      `[YIELD] COUNT_FAIL error=${error instanceof Error ? error.message : String(error)}`
+    );
+    return undefined;
+  }
+}
+
+async function recordAdvertiserPerformance(
+  advertiserId: string,
+  apiRequests: number,
+  domainsFound: number,
+  newDomains: number
+): Promise<void> {
+  try {
+    await callSupabaseRpc(
+      "spy_record_advertiser_performance_v1",
+      {
+        p_advertiser_id: advertiserId,
+        p_api_requests: Math.max(0, Math.trunc(apiRequests || 0)),
+        p_domains_found: Math.max(0, Math.trunc(domainsFound || 0)),
+        p_new_domains: Math.max(0, Math.trunc(newDomains || 0)),
+      },
+      30_000
+    );
+  } catch (error) {
+    // Yield telemetry must never block discovery/ingest.
+    console.warn(
+      `[YIELD] RECORD_FAIL advertiser=${advertiserId} error=${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
 async function claimDomainQueueNodes(
   limit: number,
   maxDepth: number
@@ -1899,10 +1953,46 @@ async function processQueueRun(
 
         const nextCursor = extractNextCursor(out);
 
+        const apiRequests = Math.max(
+          0,
+          Number(out?.stats?.api_requests || 0)
+        );
+
+        // Measure advertiser discovery yield BEFORE ingest so we can distinguish
+        // genuinely new domains from domains already known in spy_domains.
+        // This is database-only telemetry and does not consume SerpApi quota.
+        const advertiserNewDomains =
+          node.node_type === "advertiser"
+            ? await countNewDomainsBeforeIngest(
+                [...uniqueDomains] as string[]
+              )
+            : undefined;
+
         await ingestQueueDomainWorkerResults(
           node,
           out
         );
+
+        if (
+          node.node_type === "advertiser" &&
+          advertiserNewDomains !== undefined
+        ) {
+          await recordAdvertiserPerformance(
+            node.node_key,
+            apiRequests,
+            uniqueDomains.size,
+            advertiserNewDomains
+          );
+
+          const yieldRatio =
+            apiRequests > 0
+              ? advertiserNewDomains / apiRequests
+              : 0;
+
+          console.log(
+            `[YIELD] advertiser=${node.node_key} requests=${apiRequests} domains=${uniqueDomains.size} new=${advertiserNewDomains} ratio=${yieldRatio.toFixed(3)}`
+          );
+        }
 
         const workerStatus =
           String(out?.status || "").toLowerCase();
@@ -2181,7 +2271,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.4.2",
+      "0.4.3",
 
     provider_primary:
       serpApiEnabled && serpApiKey ? "serpapi" : "playwright",
@@ -3125,7 +3215,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.4.2 listening on :${port} | provider=${
+      `GBI Research Worker v0.4.3 listening on :${port} | provider=${
         serpApiEnabled && serpApiKey ? "serpapi" : "playwright"
       } | serpapi=${Boolean(serpApiKey)} | ingest=${Boolean(
         ingestUrl &&
