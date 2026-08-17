@@ -769,6 +769,8 @@ const crawlerLogMode =
 
 const compactLogAllowPatterns = [
   /^\[AUTO_QUEUE\]/,
+  /^\[AUTO_WATCH\]/,
+  /^\[WATCH\]/,
   /^\[QUEUE\]/,
   /^\[CRAWL\]/,
   /^\[SUPABASE\]/,
@@ -818,6 +820,30 @@ const autoQueueMaxDepth = Math.max(
 );
 
 const autoQueueLimit = 1;
+
+const autoWatchEnabled =
+  (process.env.AUTO_WATCH_ENABLED || "false")
+    .trim()
+    .toLowerCase() === "true";
+
+const autoWatchIntervalMs = Math.max(
+  60_000,
+  Number(process.env.AUTO_WATCH_INTERVAL_MS || 300_000)
+);
+
+const autoWatchCountry =
+  (process.env.AUTO_WATCH_COUNTRY || autoQueueCountry || "US")
+    .trim() || "US";
+
+const autoWatchLimit = Math.max(
+  1,
+  Math.min(3, Number(process.env.AUTO_WATCH_LIMIT || 1))
+);
+
+const autoWatchStaleMinutes = Math.max(
+  5,
+  Math.min(240, Number(process.env.AUTO_WATCH_STALE_MINUTES || 30))
+);
 
 const crawlTimeoutMs = Math.max(
   60_000,
@@ -875,6 +901,8 @@ function globalCooldownRemainingMs(): number {
 
 let autoQueueBusy = false;
 let autoQueueTimer: NodeJS.Timeout | undefined;
+let autoWatchBusy = false;
+let autoWatchTimer: NodeJS.Timeout | undefined;
 
 async function runGoogleAdsTransparencyCompact(
   seed: string,
@@ -1463,6 +1491,17 @@ type ClaimedQueueNode = {
   parent_key?: string | null;
 };
 
+type ClaimedAdvertiserWatch = {
+  watch_id: string;
+  run_id: string;
+  advertiser_id: string;
+  status: string;
+  watch_tier: string;
+  smart_priority_score: number;
+  watch_after?: string | null;
+  check_count: number;
+};
+
 function supabaseHeaders(): Record<string, string> {
   if (!supabaseServiceRoleKey) {
     throw new Error("SUPABASE_SERVICE_ROLE_KEY is missing");
@@ -1569,6 +1608,108 @@ async function recordAdvertiserPerformance(
     // Yield telemetry must never block discovery/ingest.
     console.warn(
       `[YIELD] RECORD_FAIL advertiser=${advertiserId} error=${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+
+async function claimAdvertiserWatchNodes(
+  limit: number
+): Promise<ClaimedAdvertiserWatch[]> {
+  const data = await callSupabaseRpc(
+    "spy_claim_advertiser_watch_queue_v1",
+    { p_limit: limit },
+    30_000
+  );
+
+  return Array.isArray(data)
+    ? data.map((item: any) => ({
+        watch_id: String(item.watch_id),
+        run_id: String(item.run_id),
+        advertiser_id: String(item.advertiser_id),
+        status: String(item.status || "running"),
+        watch_tier: String(item.watch_tier || "LOW"),
+        smart_priority_score: Number(item.smart_priority_score || 0),
+        watch_after:
+          item.watch_after == null ? null : String(item.watch_after),
+        check_count: Number(item.check_count || 0),
+      }))
+    : [];
+}
+
+async function ingestAdvertiserWatchResults(
+  advertiserId: string,
+  workerOutput: any
+): Promise<any> {
+  const rows = Array.isArray(workerOutput?.results)
+    ? workerOutput.results
+        .map((result: any) => {
+          const raw = getRawPayload(result);
+          const domain = normalizeDomain(
+            result?.domain ?? raw?.discovered_domain ?? raw?.domain
+          );
+
+          if (!domain) return null;
+
+          return {
+            domain,
+            creative_count: Math.max(
+              1,
+              Number(result?.creative_count ?? raw?.creative_count ?? 1) || 1
+            ),
+          };
+        })
+        .filter(Boolean)
+    : [];
+
+  const dedupedRows = Array.from(
+    new Map(
+      rows.map((row: any) => [String(row.domain), row])
+    ).values()
+  );
+
+  return callSupabaseRpc(
+    "spy_ingest_advertiser_watch_results_v1",
+    {
+      p_advertiser_id: advertiserId,
+      p_results: dedupedRows,
+    },
+    60_000
+  );
+}
+
+async function finishAdvertiserWatch(
+  watch: ClaimedAdvertiserWatch,
+  status: "completed" | "failed",
+  domains: string[],
+  apiRequests: number,
+  error?: string
+): Promise<any> {
+  return callSupabaseRpc(
+    "spy_finish_advertiser_watch_v1",
+    {
+      p_watch_id: watch.watch_id,
+      p_run_id: watch.run_id,
+      p_status: status,
+      p_domains: domains,
+      p_api_requests: Math.max(0, Math.trunc(apiRequests || 0)),
+      p_error: error ?? null,
+    },
+    60_000
+  );
+}
+
+async function recoverStaleAdvertiserWatch(): Promise<void> {
+  try {
+    await callSupabaseRpc(
+      "spy_recover_stale_advertiser_watch_v1",
+      { p_stale_minutes: autoWatchStaleMinutes },
+      30_000
+    );
+  } catch (error) {
+    console.warn(
+      `[AUTO_WATCH] RECOVER_FAIL error=${
+        error instanceof Error ? error.message : String(error)
+      }`
     );
   }
 }
@@ -2271,7 +2412,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.4.3",
+      "0.4.4",
 
     provider_primary:
       serpApiEnabled && serpApiKey ? "serpapi" : "playwright",
@@ -2335,6 +2476,24 @@ app.get("/health", (_req, res) => {
 
     auto_queue_busy:
       autoQueueBusy,
+
+    auto_watch_enabled:
+      autoWatchEnabled,
+
+    auto_watch_interval_ms:
+      autoWatchIntervalMs,
+
+    auto_watch_limit:
+      autoWatchLimit,
+
+    auto_watch_country:
+      autoWatchCountry,
+
+    auto_watch_busy:
+      autoWatchBusy,
+
+    auto_watch_stale_minutes:
+      autoWatchStaleMinutes,
 
     queue_protection:
       true,
@@ -2899,6 +3058,166 @@ function startAutoQueueScheduler(): void {
 }
 
 /* =========================================================
+   ADVERTISER WATCH RUNNER
+========================================================= */
+
+async function runAutoWatchTick(): Promise<void> {
+  if (!autoWatchEnabled) return;
+
+  const cooldownRemaining = globalCooldownRemainingMs();
+  if (cooldownRemaining > 0) {
+    console.log(
+      `[AUTO_WATCH] SKIP reason=global_cooldown remaining_ms=${cooldownRemaining} cooldown_reason=${globalCooldownReason || "unknown"}`
+    );
+    return;
+  }
+
+  if (autoWatchBusy) {
+    console.log("[AUTO_WATCH] SKIP reason=busy");
+    return;
+  }
+
+  // Never run the Watch crawler in parallel with graph discovery.
+  // Both consume the same SerpApi quota/provider.
+  if (autoQueueBusy) {
+    console.log("[AUTO_WATCH] SKIP reason=auto_queue_busy");
+    return;
+  }
+
+  autoWatchBusy = true;
+
+  try {
+    const watches = await claimAdvertiserWatchNodes(autoWatchLimit);
+
+    if (watches.length === 0) {
+      console.log("[AUTO_WATCH] IDLE claimed=0");
+      return;
+    }
+
+    for (const watch of watches) {
+      let apiRequests = 0;
+
+      try {
+        console.log(
+          `[WATCH] START advertiser=${watch.advertiser_id} tier=${watch.watch_tier} score=${watch.smart_priority_score} run_id=${watch.run_id}`
+        );
+
+        const out = await runSerpApiAdvertiserExpansion(
+          watch.advertiser_id,
+          autoWatchCountry
+        );
+
+        apiRequests = Math.max(
+          0,
+          Number(out?.stats?.api_requests || 0)
+        );
+
+        const domains: string[] = [
+          ...new Set<string>(
+            (Array.isArray(out?.results) ? out.results : [])
+              .map((result: any): string | undefined =>
+                normalizeDomain(
+                  result?.domain ??
+                    getRawPayload(result)?.discovered_domain ??
+                    getRawPayload(result)?.domain
+                )
+              )
+              .filter((domain: string | undefined): domain is string =>
+                typeof domain === "string" && domain.length > 0
+              )
+          ),
+        ];
+
+        // Measure global discovery yield BEFORE Watch ingest writes new domains.
+        const globalNewDomains = await countNewDomainsBeforeIngest(domains);
+
+        const ingestResult = await ingestAdvertiserWatchResults(
+          watch.advertiser_id,
+          out
+        );
+
+        if (globalNewDomains !== undefined) {
+          await recordAdvertiserPerformance(
+            watch.advertiser_id,
+            apiRequests,
+            domains.length,
+            globalNewDomains
+          );
+        }
+
+        const finishResult = await finishAdvertiserWatch(
+          watch,
+          "completed",
+          domains,
+          apiRequests
+        );
+
+        console.log(
+          `[WATCH] DONE advertiser=${watch.advertiser_id} requests=${apiRequests} domains=${domains.length} global_new=${globalNewDomains ?? "unknown"} ingest_global_new=${String(ingestResult?.global_new_domains ?? "unknown")} next_check=${String(finishResult?.next_check_at ?? "scheduled")}`
+        );
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : String(error);
+
+        console.error(
+          `[WATCH] FAILED advertiser=${watch.advertiser_id} error=${message}`
+        );
+
+        try {
+          await finishAdvertiserWatch(
+            watch,
+            "failed",
+            [],
+            apiRequests,
+            message
+          );
+        } catch (finishError) {
+          console.error(
+            `[WATCH] FAILED_TO_FINISH advertiser=${watch.advertiser_id} watch_id=${watch.watch_id} run_id=${watch.run_id} error=${
+              finishError instanceof Error
+                ? finishError.message
+                : String(finishError)
+            }`
+          );
+        }
+      }
+    }
+  } catch (error) {
+    console.error(
+      `[AUTO_WATCH] ERROR error=${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  } finally {
+    autoWatchBusy = false;
+  }
+}
+
+function startAdvertiserWatchScheduler(): void {
+  if (!autoWatchEnabled) {
+    console.log("[AUTO_WATCH] disabled");
+    return;
+  }
+
+  console.log(
+    `[AUTO_WATCH] enabled interval_ms=${autoWatchIntervalMs} limit=${autoWatchLimit} country=${autoWatchCountry} stale_minutes=${autoWatchStaleMinutes}`
+  );
+
+  setTimeout(() => {
+    void (async () => {
+      await recoverStaleAdvertiserWatch();
+      await runAutoWatchTick();
+    })();
+  }, 30_000);
+
+  autoWatchTimer = setInterval(() => {
+    void runAutoWatchTick();
+  }, autoWatchIntervalMs);
+
+  autoWatchTimer.unref?.();
+}
+
+/* =========================================================
    SPY ADS QUEUE RUNNER
 ========================================================= */
 
@@ -3215,7 +3534,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.4.3 listening on :${port} | provider=${
+      `GBI Research Worker v0.4.4 listening on :${port} | provider=${
         serpApiEnabled && serpApiKey ? "serpapi" : "playwright"
       } | serpapi=${Boolean(serpApiKey)} | ingest=${Boolean(
         ingestUrl &&
@@ -3223,9 +3542,10 @@ app.listen(
       )} | image-resolver=true | csv-importer=true | supabase=${Boolean(
         supabaseUrl &&
           supabaseServiceRoleKey
-      )} | auto-queue=${autoQueueEnabled} | crawler-logs=${crawlerLogMode}`
+      )} | auto-queue=${autoQueueEnabled} | auto-watch=${autoWatchEnabled} | crawler-logs=${crawlerLogMode}`
     );
 
     startAutoQueueScheduler();
+    startAdvertiserWatchScheduler();
   }
 );
