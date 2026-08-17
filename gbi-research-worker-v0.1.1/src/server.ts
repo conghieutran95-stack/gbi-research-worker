@@ -1679,7 +1679,7 @@ async function ingestAdvertiserWatchResults(
 
 async function finishAdvertiserWatch(
   watch: ClaimedAdvertiserWatch,
-  status: "completed" | "failed",
+  status: "done" | "failed",
   domains: string[],
   apiRequests: number,
   error?: string
@@ -3147,7 +3147,7 @@ async function runAutoWatchTick(): Promise<void> {
 
         const finishResult = await finishAdvertiserWatch(
           watch,
-          "completed",
+          "done",
           domains,
           apiRequests
         );
