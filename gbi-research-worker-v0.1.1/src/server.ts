@@ -388,7 +388,7 @@ async function resolveSerpApiCreativeDomain(
   return undefined;
 }
 
-async function runSerpApiAdsTransparency(
+async function runSerpApiDomainAdvertiserDiscovery(
   seed: string,
   country?: string
 ): Promise<any> {
@@ -403,9 +403,12 @@ async function runSerpApiAdsTransparency(
   const region = serpRegion(country);
 
   console.log(
-    `[SERPAPI] START seed=${seedDomain} country=${country || "any"}`
+    `[SERPAPI_DOMAIN] START seed=${seedDomain} country=${country || "any"}`
   );
 
+  // Domain -> Advertiser must be a single SEARCH request.
+  // Advertiser expansion is handled later by its own queue node, so do not
+  // crawl every advertiser again here (that previously caused 1 + N requests).
   const seedSearch = await serpApiRequest(
     {
       engine: "google_ads_transparency_center",
@@ -422,166 +425,97 @@ async function runSerpApiAdsTransparency(
     ? seedSearch.ad_creatives
     : [];
 
-  const advertiserMap = new Map<string, string>();
-  for (const creative of seedCreatives) {
-    if (!creative?.advertiser_id) continue;
-    if (!advertiserMap.has(creative.advertiser_id)) {
-      advertiserMap.set(creative.advertiser_id, creative.advertiser || "");
-    }
-  }
-
-  const advertisers = [...advertiserMap.entries()]
-    .slice(0, serpApiMaxAdvertisersPerSeed)
-    .map(([advertiser_id, advertiser_name]) => ({
-      advertiser_id,
-      advertiser_name,
-    }));
-  stats.advertiser_count = advertisers.length;
-
-  const domainMap = new Map<
+  const advertiserMap = new Map<
     string,
     {
+      advertiser_name: string;
       creativeIds: Set<string>;
-      advertisers: Map<string, string>;
       dates: string[];
     }
   >();
 
-  const addDomain = (
-    domainValue: unknown,
-    creative: SerpApiCreative,
-    advertiserName?: string
-  ) => {
-    const domain = normalizeDomain(domainValue);
-    if (!domain) return;
+  for (const creative of seedCreatives) {
+    const advertiserId =
+      typeof creative?.advertiser_id === "string"
+        ? creative.advertiser_id.trim()
+        : "";
+    if (!advertiserId) continue;
 
-    const current = domainMap.get(domain) || {
+    const current = advertiserMap.get(advertiserId) || {
+      advertiser_name:
+        typeof creative?.advertiser === "string" ? creative.advertiser : "",
       creativeIds: new Set<string>(),
-      advertisers: new Map<string, string>(),
       dates: [],
     };
-    if (creative.ad_creative_id) current.creativeIds.add(creative.ad_creative_id);
-    if (creative.advertiser_id) {
-      current.advertisers.set(
-        creative.advertiser_id,
-        advertiserName || creative.advertiser || ""
-      );
+
+    if (!current.advertiser_name && typeof creative?.advertiser === "string") {
+      current.advertiser_name = creative.advertiser;
     }
+    if (creative.ad_creative_id) current.creativeIds.add(creative.ad_creative_id);
+
     const first = unixToIso(creative.first_shown);
     const last = unixToIso(creative.last_shown);
     if (first) current.dates.push(first);
     if (last) current.dates.push(last);
-    domainMap.set(domain, current);
-  };
 
-  // Keep seed-search evidence too. This is cheap and confirms advertiser ↔ seed.
-  for (const creative of seedCreatives) {
-    addDomain(creative.target_domain || seedDomain, creative);
+    advertiserMap.set(advertiserId, current);
   }
 
-  for (const advertiser of advertisers) {
-    let nextPageToken: string | undefined;
-    let detailBudget = serpApiMaxDetailsPerAdvertiser;
-    let noNewDomainPages = 0;
+  const advertisers = [...advertiserMap.entries()]
+    .slice(0, serpApiMaxAdvertisersPerSeed)
+    .map(([advertiser_id, item]) => {
+      const dates = [...new Set(item.dates)].sort();
+      const first = dates[0];
+      const last = dates.length ? dates[dates.length - 1] : undefined;
 
-    for (let page = 0; page < serpApiMaxPagesPerAdvertiser; page += 1) {
-      const before = domainMap.size;
-      const data = await serpApiRequest(
-        {
-          engine: "google_ads_transparency_center",
-          advertiser_id: advertiser.advertiser_id,
-          platform: "SEARCH",
-          region,
-          num: 100,
-          next_page_token: nextPageToken,
+      return {
+        domain: seedDomain,
+        creative_count: Math.max(1, item.creativeIds.size),
+        first_seen: first,
+        last_seen: last,
+        activity_status: "UNKNOWN",
+        observed_at: new Date().toISOString(),
+        source_ref: seedDomain,
+        raw_payload: {
+          mode: "SERPAPI_DOMAIN_TO_ADVERTISER",
+          provider: "serpapi",
+          seed_domain: seedDomain,
+          discovered_domain: seedDomain,
+          advertiser_id,
+          advertiser_name: item.advertiser_name,
+          advertiser_count: 1,
+          advertiser_ids: [advertiser_id],
+          advertisers: [
+            {
+              advertiser_id,
+              advertiser_name: item.advertiser_name,
+            },
+          ],
+          creative_count: Math.max(1, item.creativeIds.size),
+          ads_first_seen: first,
+          ads_last_seen: last,
+          crawler_discovered_at: new Date().toISOString(),
+          crawler_last_checked_at: new Date().toISOString(),
+          discovered_via: "SERPAPI_DOMAIN_TO_ADVERTISER",
+          serpapi_stats: stats,
         },
-        stats
-      );
-      stats.pages_fetched += 1;
+      };
+    });
 
-      const creatives: SerpApiCreative[] = Array.isArray(data?.ad_creatives)
-        ? data.ad_creatives
-        : [];
-
-      for (const creative of creatives) {
-        let domain = normalizeDomain(creative.target_domain);
-
-        if (!domain && detailBudget > 0) {
-          try {
-            domain = await resolveSerpApiCreativeDomain(creative, country, stats);
-          } catch (error) {
-            console.warn(
-              `[SERPAPI] DETAIL_FAIL advertiser=${advertiser.advertiser_id} creative=${creative.ad_creative_id || "unknown"} error=${error instanceof Error ? error.message : String(error)}`
-            );
-          }
-          detailBudget -= 1;
-        }
-
-        if (domain) addDomain(domain, creative, advertiser.advertiser_name);
-      }
-
-      const after = domainMap.size;
-      if (after === before) noNewDomainPages += 1;
-      else noNewDomainPages = 0;
-
-      nextPageToken =
-        typeof data?.serpapi_pagination?.next_page_token === "string"
-          ? data.serpapi_pagination.next_page_token
-          : undefined;
-
-      if (!nextPageToken || noNewDomainPages >= 1) break;
-    }
-  }
-
-  const results = [...domainMap.entries()].map(([domain, item]) => {
-    const dates = [...new Set(item.dates)].sort();
-    const advertiserRows = [...item.advertisers.entries()].map(
-      ([advertiser_id, advertiser_name]) => ({ advertiser_id, advertiser_name })
-    );
-    const first = dates[0];
-    const last = dates.length ? dates[dates.length - 1] : undefined;
-
-    return {
-      domain,
-      creative_count: item.creativeIds.size,
-      first_seen: first,
-      last_seen: last,
-      activity_status: "UNKNOWN",
-      observed_at: new Date().toISOString(),
-      source_ref: seedDomain,
-      raw_payload: {
-        mode: "SERPAPI_GOOGLE_ADS_TRANSPARENCY",
-        provider: "serpapi",
-        seed_domain: seedDomain,
-        discovered_domain: domain,
-        advertiser_count: advertiserRows.length,
-        advertiser_ids: advertiserRows.map((x) => x.advertiser_id),
-        advertisers: advertiserRows,
-        creative_count: item.creativeIds.size,
-        ads_first_seen: first,
-        ads_last_seen: last,
-        crawler_discovered_at: new Date().toISOString(),
-        crawler_last_checked_at: new Date().toISOString(),
-        discovered_via: "SERPAPI_ADVERTISER_EXPANSION",
-        serpapi_stats: stats,
-      },
-    };
-  });
-
-  stats.domains_discovered = results.length;
+  stats.advertiser_count = advertisers.length;
+  stats.domains_discovered = advertisers.length > 0 ? 1 : 0;
 
   console.log(
-    `[SERPAPI] DONE seed=${seedDomain} advertisers=${stats.advertiser_count} domains=${stats.domains_discovered} requests=${stats.api_requests} pages=${stats.pages_fetched} details=${stats.details_fetched}`
+    `[SERPAPI_DOMAIN] DONE seed=${seedDomain} advertisers=${stats.advertiser_count} requests=${stats.api_requests} pages=${stats.pages_fetched} details=${stats.details_fetched}`
   );
 
   return {
     status: "completed",
     provider: "serpapi",
     message:
-      `SerpApi completed. advertisers=${stats.advertiser_count}; ` +
-      `domains=${stats.domains_discovered}; requests=${stats.api_requests}; ` +
-      `pages=${stats.pages_fetched}; details=${stats.details_fetched}.`,
-    results,
+      `SerpApi domain discovery completed. advertisers=${stats.advertiser_count}; ` +
+      `requests=${stats.api_requests}; pages=${stats.pages_fetched}; details=${stats.details_fetched}.`,
+    results: advertisers,
     stats,
   };
 }
@@ -613,10 +547,9 @@ async function runSerpApiAdvertiserExpansion(
   >();
 
   let nextPageToken: string | undefined;
-  // Never waste the detail budget on creatives that do not have a creative ID.
-  // Keep at least one details lookup enabled so advertiser expansion can resolve
-  // destination domains even if the environment variable was accidentally 0.
-  let detailBudget = Math.max(1, serpApiMaxDetailsPerAdvertiser);
+  // Respect the configured detail budget exactly. Set the environment value to 1
+  // when one fallback detail lookup per advertiser is desired; 0 truly disables it.
+  let detailBudget = serpApiMaxDetailsPerAdvertiser;
   let noNewDomainPages = 0;
 
   for (let page = 0; page < serpApiMaxPagesPerAdvertiser; page += 1) {
@@ -649,60 +582,85 @@ async function runSerpApiAdvertiserExpansion(
       `[SERPAPI_ADVERTISER] PAGE advertiser=${advertiserKey} page=${page + 1} creatives=${creatives.length} creatives_with_id=${creativesWithIds} detail_budget=${detailBudget}`
     );
 
-    for (const creative of creatives) {
-      const enrichedCreative: SerpApiCreative = {
-        ...creative,
-        advertiser_id: creative.advertiser_id || advertiserKey,
-      };
+    const unresolvedCreatives: SerpApiCreative[] = [];
 
-      let domain = normalizeDomain(
-        enrichedCreative.target_domain ||
-          enrichedCreative.visible_link ||
-          enrichedCreative.link
-      );
-
-      const canFetchDetail = Boolean(
-        enrichedCreative.advertiser_id &&
-          enrichedCreative.ad_creative_id &&
-          detailBudget > 0
-      );
-
-      if (!domain && canFetchDetail) {
-        try {
-          domain = await resolveSerpApiCreativeDomain(
-            enrichedCreative,
-            country,
-            stats
-          );
-        } catch (error) {
-          console.warn(
-            `[SERPAPI_ADVERTISER] DETAIL_FAIL advertiser=${advertiserKey} creative=${enrichedCreative.ad_creative_id || "unknown"} error=${
-              error instanceof Error ? error.message : String(error)
-            }`
-          );
-        } finally {
-          // Decrement only when a details request was actually eligible to run.
-          detailBudget -= 1;
-        }
-      }
-
-      if (!domain) continue;
+    const addAdvertiserDomain = (
+      domainValue: unknown,
+      creative: SerpApiCreative
+    ) => {
+      const domain = normalizeDomain(domainValue);
+      if (!domain) return false;
 
       const current = domainMap.get(domain) || {
         creativeIds: new Set<string>(),
         dates: [],
       };
 
-      if (enrichedCreative.ad_creative_id) {
-        current.creativeIds.add(enrichedCreative.ad_creative_id);
+      if (creative.ad_creative_id) {
+        current.creativeIds.add(creative.ad_creative_id);
       }
 
-      const first = unixToIso(enrichedCreative.first_shown);
-      const last = unixToIso(enrichedCreative.last_shown);
+      const first = unixToIso(creative.first_shown);
+      const last = unixToIso(creative.last_shown);
       if (first) current.dates.push(first);
       if (last) current.dates.push(last);
 
       domainMap.set(domain, current);
+      return true;
+    };
+
+    // First pass: use structured destination fields from every SEARCH creative.
+    // Do not spend a details request until we know the whole page gave us no domain.
+    for (const creative of creatives) {
+      const enrichedCreative: SerpApiCreative = {
+        ...creative,
+        advertiser_id: creative.advertiser_id || advertiserKey,
+      };
+
+      const directDomain = normalizeDomain(
+        enrichedCreative.target_domain ||
+          enrichedCreative.visible_link ||
+          enrichedCreative.link
+      );
+
+      if (directDomain) {
+        addAdvertiserDomain(directDomain, enrichedCreative);
+      } else if (
+        enrichedCreative.advertiser_id &&
+        enrichedCreative.ad_creative_id
+      ) {
+        unresolvedCreatives.push(enrichedCreative);
+      }
+    }
+
+    // Fallback only when this page produced no structured domain at all.
+    // This avoids paying for a detail/OCR request when another creative on the
+    // same page already exposes the destination domain directly.
+    if (domainMap.size === before && detailBudget > 0) {
+      for (const creative of unresolvedCreatives) {
+        if (detailBudget <= 0) break;
+
+        try {
+          const resolvedDomain = await resolveSerpApiCreativeDomain(
+            creative,
+            country,
+            stats
+          );
+          detailBudget -= 1;
+
+          if (resolvedDomain) {
+            addAdvertiserDomain(resolvedDomain, creative);
+            break;
+          }
+        } catch (error) {
+          detailBudget -= 1;
+          console.warn(
+            `[SERPAPI_ADVERTISER] DETAIL_FAIL advertiser=${advertiserKey} creative=${creative.ad_creative_id || "unknown"} error=${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
+      }
     }
 
     const after = domainMap.size;
@@ -778,17 +736,17 @@ async function runSpyAdsDiscoveryCompact(
 ): Promise<any> {
   if (serpApiEnabled && serpApiKey) {
     try {
-      const out = await runSerpApiAdsTransparency(seed, country);
+      const out = await runSerpApiDomainAdvertiserDiscovery(seed, country);
       const resultCount = Array.isArray(out?.results) ? out.results.length : 0;
       if (resultCount > 0 || !serpApiFallbackOnEmpty) {
         return out;
       }
       console.warn(
-        `[SERPAPI] EMPTY seed=${seed} fallback=playwright`
+        `[SERPAPI_DOMAIN] EMPTY seed=${seed} fallback=playwright`
       );
     } catch (error) {
       console.warn(
-        `[SERPAPI] FAILED seed=${seed} fallback=playwright error=${
+        `[SERPAPI_DOMAIN] FAILED seed=${seed} fallback=playwright error=${
           error instanceof Error ? error.message : String(error)
         }`
       );
@@ -820,6 +778,7 @@ const compactLogAllowPatterns = [
   /^\[SPY ADS .*RATE_LIMIT_STOP/i,
   /^\[SPY ADS .*ERROR/i,
   /^\[SERPAPI\]/,
+  /^\[SERPAPI_DOMAIN\]/,
   /^\[SERPAPI_ADVERTISER\]/,
   /^GBI Research Worker/,
   /^Starting Container/,
@@ -2222,7 +2181,7 @@ app.get("/health", (_req, res) => {
       "gbi-research-worker",
 
     version:
-      "0.4.1",
+      "0.4.2",
 
     provider_primary:
       serpApiEnabled && serpApiKey ? "serpapi" : "playwright",
@@ -2258,7 +2217,7 @@ app.get("/health", (_req, res) => {
       true,
 
     queue_runner_mode:
-      "domain_and_advertiser_v2",
+      "domain_and_advertiser_cost_optimized_v3",
 
     crawler_log_mode:
       crawlerLogMode,
@@ -3166,7 +3125,7 @@ app.listen(
   "0.0.0.0",
   () => {
     console.log(
-      `GBI Research Worker v0.4.1 listening on :${port} | provider=${
+      `GBI Research Worker v0.4.2 listening on :${port} | provider=${
         serpApiEnabled && serpApiKey ? "serpapi" : "playwright"
       } | serpapi=${Boolean(serpApiKey)} | ingest=${Boolean(
         ingestUrl &&
